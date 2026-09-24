@@ -7,7 +7,7 @@
 export const SUPABASE_URL = 'https://vrmdgbspgizhgzvlnmjq.supabase.co'
 export const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_9BOfFizIFRBz-rGiP1nVMg_WNbxPU5X' // or the legacy "anon" key
 
-export const APP_NAME = 'Chat'
+export const APP_NAME = 'HopsGPT'
 
 // Show "Create an account" on the sign-in screen. Set to false once your own
 // account exists (and turn off sign-ups in Supabase → Authentication).
