@@ -17,6 +17,8 @@
 //   CONTEXT_MAX_MESSAGES  optional  how many recent messages the model sees (default 40)
 //   CONTEXT_MAX_CHARS     optional  character budget for that history (default 60000)
 //   MAX_OUTPUT_TOKENS     optional  cap on reply length (default: provider default)
+//   CONTEXT_MAX_FILE_CHARS optional characters of attached files the model sees (default 150000)
+//   CONTEXT_MAX_IMAGES    optional  how many attached images the model sees (default 10)
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { createClient, type SupabaseClient } from 'npm:@supabase/supabase-js@2.116.0'
@@ -43,6 +45,8 @@ const SYSTEM_PROMPT = env('SYSTEM_PROMPT') ||
 const CONTEXT_MAX_MESSAGES = int(env('CONTEXT_MAX_MESSAGES'), 40)
 const CONTEXT_MAX_CHARS = int(env('CONTEXT_MAX_CHARS'), 60_000)
 const MAX_OUTPUT_TOKENS = int(env('MAX_OUTPUT_TOKENS'), 0)
+const CONTEXT_MAX_FILE_CHARS = int(env('CONTEXT_MAX_FILE_CHARS'), 150_000)
+const CONTEXT_MAX_IMAGES = int(env('CONTEXT_MAX_IMAGES'), 10)
 
 const MAX_INPUT_CHARS = 100_000
 const MAX_INSTRUCTIONS_CHARS = 20_000
@@ -50,6 +54,10 @@ const MAX_MEMORIES = 150
 const MEMORY_CONTEXT_CHARS = 8_000
 const CHECKPOINT_EVERY_MS = 2_000
 const HEARTBEAT_EVERY_MS = 15_000
+const MAX_ATTACHMENTS = 10
+const BUCKET = 'chat-files'
+const UPGRADE_V3 = 'Files, editing and retrying need a database update. Run supabase/upgrade-v3.sql in the SQL Editor.'
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 const IS_OPENROUTER = LLM_BASE_URL.includes('openrouter.ai')
 const IS_OPENAI = LLM_BASE_URL.includes('api.openai.com')
@@ -129,7 +137,10 @@ const corsHeaders = {
 interface ChatRequest {
   action?: unknown
   conversation_id?: string | null
+  parent_id?: unknown
+  message_id?: unknown
   message?: unknown
+  attachment_ids?: unknown
   model?: unknown
   system_prompt?: unknown
   timezone?: unknown
@@ -143,14 +154,38 @@ interface Prefs {
 }
 
 interface HistoryRow {
+  id?: string
   role: 'user' | 'assistant'
   content: string
 }
 
+type ContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
+
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
-  content: string
+  content: string | ContentPart[]
 }
+
+interface AttachmentRow {
+  id: string
+  conversation_id: string | null
+  message_id: string | null
+  name: string
+  mime: string
+  size: number
+  kind: 'image' | 'document' | 'file'
+  storage_path: string | null
+  image_paths: string[] | null
+  text_chars: number
+  position: number
+  meta: Record<string, unknown> | null
+  text_content?: string | null
+}
+
+const ATTACHMENT_FIELDS =
+  'id, conversation_id, message_id, name, mime, size, kind, storage_path, image_paths, text_chars, position, meta'
 
 interface MemoryRow {
   id: string
@@ -178,10 +213,19 @@ interface StreamChunk {
 }
 
 type StreamEvent =
-  | { type: 'meta'; conversation_id: string; title: string; created: boolean; user_message_id: string; model: string }
+  | {
+    type: 'meta'
+    conversation_id: string
+    title: string
+    created: boolean
+    user_message_id: string
+    parent_id: string | null
+    model: string
+  }
   | { type: 'thinking' }
   | { type: 'delta'; text: string }
   | { type: 'error'; message: string }
+  | { type: 'saved'; message_id: string } // the reply's id, as soon as it's first saved (Stop may come before 'done')
   | { type: 'done'; message_id: string | null; saved: boolean; finish_reason: string | null }
   | { type: 'memory'; changes: number }
 
@@ -241,8 +285,12 @@ async function handleRequest(req: Request): Promise<Response> {
 
 async function handleChat(body: ChatRequest, db: SupabaseClient, userId: string): Promise<Response> {
   // 2. Validate the request
-  const text = typeof body.message === 'string' ? clean(body.message).trim() : ''
-  if (!text) throw new HttpError(400, 'Message is empty.')
+  const regenerate = body.action === 'regenerate'
+  const v3 = await hasV3(db)
+  const attachmentIds = parseIds(body.attachment_ids)
+  if ((regenerate || attachmentIds.length > 0) && !v3) throw new HttpError(400, UPGRADE_V3)
+  const text = !regenerate && typeof body.message === 'string' ? clean(body.message).trim() : ''
+  if (!regenerate && !text && attachmentIds.length === 0) throw new HttpError(400, 'Message is empty.')
   if (text.length > MAX_INPUT_CHARS) {
     throw new HttpError(413, `Message is too long (max ${MAX_INPUT_CHARS.toLocaleString('en')} characters).`)
   }
@@ -251,9 +299,12 @@ async function handleChat(body: ChatRequest, db: SupabaseClient, userId: string)
   // 3. Find the chat, or create it on the first message
   let conversation: { id: string; title: string; system_prompt: string }
   const isNew = !body.conversation_id
+  if (regenerate && isNew) throw new HttpError(400, 'Nothing to retry yet.')
+  let attachments: AttachmentRow[] = []
+  if (attachmentIds.length > 0) attachments = await loadAttachmentsById(db, attachmentIds)
   if (!isNew) {
     const id = String(body.conversation_id)
-    if (!/^[0-9a-f-]{36}$/i.test(id)) throw new HttpError(404, 'Chat not found.')
+    if (!UUID.test(id)) throw new HttpError(404, 'Chat not found.')
     const { data, error } = await db.from('chat_conversations').select('id, title, system_prompt').eq('id', id)
       .maybeSingle()
     if (error) throw dbError(error)
@@ -265,37 +316,70 @@ async function handleChat(body: ChatRequest, db: SupabaseClient, userId: string)
       : ''
     const { data, error } = await db
       .from('chat_conversations')
-      .insert({ user_id: userId, title: titleFrom(text), model, system_prompt: instructions })
+      .insert({
+        user_id: userId,
+        title: titleFrom(text || attachments[0]?.name || ''),
+        model,
+        system_prompt: instructions,
+      })
       .select('id, title, system_prompt')
       .single()
     if (error) throw dbError(error)
     conversation = data
   }
 
-  // 4. Save the user's message
-  const { data: userMessage, error: insertError } = await db
-    .from('chat_messages')
-    .insert({ conversation_id: conversation.id, user_id: userId, role: 'user', content: text })
-    .select('id')
-    .single()
-  if (insertError) throw dbError(insertError)
-
-  // 5. Build the context: instructions, memory, past chats, recent history
-  const [historyResult, settings, memories] = await Promise.all([
-    db
+  // 4. Save the user's message (or, for "Retry", find the one being answered again)
+  let userMessageId: string
+  let userText: string
+  let parentId: string | null = null
+  if (regenerate) {
+    const id = String(body.message_id ?? '')
+    if (!UUID.test(id)) throw new HttpError(400, 'Nothing to retry.')
+    const { data, error } = await db.from('chat_messages').select('id, role, content, parent_id')
+      .eq('id', id).eq('conversation_id', conversation.id).maybeSingle()
+    if (error) throw dbError(error)
+    if (!data || data.role !== 'user') throw new HttpError(404, 'That message no longer exists.')
+    userMessageId = data.id
+    userText = data.content
+    parentId = data.parent_id
+  } else {
+    for (const a of attachments) {
+      const fresh = a.message_id === null && (a.conversation_id === null || a.conversation_id === conversation.id)
+      const reused = a.message_id !== null && a.conversation_id === conversation.id
+      if (!fresh && !reused) throw new HttpError(400, `"${a.name}" can't be attached here. Attach it again.`)
+    }
+    if (v3 && !isNew) parentId = await pickParent(db, body, conversation.id)
+    const { data: userMessage, error: insertError } = await db
       .from('chat_messages')
-      .select('role, content')
-      .eq('conversation_id', conversation.id)
-      .order('created_at', { ascending: false })
-      .limit(CONTEXT_MAX_MESSAGES),
+      .insert({
+        conversation_id: conversation.id,
+        user_id: userId,
+        role: 'user',
+        content: text,
+        ...(v3 ? { parent_id: parentId } : {}),
+      })
+      .select('id')
+      .single()
+    if (insertError) throw dbError(insertError)
+    userMessageId = userMessage.id
+    userText = text
+    if (attachments.length > 0) await linkAttachments(db, attachments, conversation.id, userMessageId)
+  }
+  if (v3) await setLeaf(db, conversation.id, userMessageId)
+
+  // 5. Build the context: instructions, memory, past chats, this branch of the chat (+ its files)
+  const [historyRows, settings, memories] = await Promise.all([
+    loadHistory(db, conversation.id, v3 ? userMessageId : null),
     loadSettings(db, userId),
     loadMemories(db, userId),
   ])
-  if (historyResult.error) throw dbError(historyResult.error)
-  const history = fitHistory((historyResult.data as HistoryRow[]).reverse())
+  const kept = fitHistory(historyRows)
+  const { messages: history, imageCount } = v3
+    ? await withAttachments(db, kept, userMessageId)
+    : { messages: mergeTurns(kept.map((r) => ({ role: r.role, content: r.content }))), imageCount: 0 }
   const memoryOn = settings.v2 && settings.prefs.memory !== false
-  const pastChats = settings.v2 && settings.prefs.referenceChats === true
-    ? await searchPastChats(db, text, conversation.id)
+  const pastChats = settings.v2 && settings.prefs.referenceChats === true && userText
+    ? await searchPastChats(db, userText, conversation.id)
     : ''
   const system = buildSystemPrompt({
     customInstructions: settings.customInstructions,
@@ -313,17 +397,20 @@ async function handleChat(body: ChatRequest, db: SupabaseClient, userId: string)
     userId,
     model,
     conversationId: conversation.id,
+    parentId: v3 ? userMessageId : null,
+    hasImages: imageCount > 0,
     meta: {
       type: 'meta',
       conversation_id: conversation.id,
       title: conversation.title,
       created: isNew,
-      user_message_id: userMessage.id,
+      user_message_id: userMessageId,
+      parent_id: parentId,
       model,
     },
     messages,
     saveWith,
-    afterReply: memoryOn && text.length >= 8
+    afterReply: memoryOn && !regenerate && userText.length >= 8
       ? async (reply) => {
         const result = await runMemoryUpdate({
           client: saveWith,
@@ -331,12 +418,275 @@ async function handleChat(body: ChatRequest, db: SupabaseClient, userId: string)
           model: MEMORY_MODEL || model,
           memories,
           maxAdds: 5,
-          task: `Latest exchange:\nUser: ${text.slice(0, 4000)}\nAssistant: ${stripArtifacts(reply).slice(0, 1500)}`,
+          task: `Latest exchange:\nUser: ${userText.slice(0, 4000)}\nAssistant: ${
+            stripArtifacts(reply).slice(0, 1500)
+          }`,
         })
         return result.added + result.updated + result.deleted
       }
       : undefined,
   })
+}
+
+// ── Message tree & attachments (v3) ──────────────────────────────────────────
+
+let v3Probe: { ok: boolean; at: number } | null = null
+
+/** True once supabase/upgrade-v3.sql has been run (checked again every 15 s until then). */
+async function hasV3(db: SupabaseClient): Promise<boolean> {
+  if (v3Probe && (v3Probe.ok || Date.now() - v3Probe.at < 15_000)) return v3Probe.ok
+  const { error } = await db.from('chat_attachments').select('id').limit(1)
+  const missing = ['PGRST205', '42P01', 'PGRST204', '42703'].includes(error?.code ?? '')
+  v3Probe = { ok: !missing, at: Date.now() }
+  return !missing
+}
+
+function parseIds(value: unknown): string[] {
+  if (value === undefined || value === null) return []
+  if (!Array.isArray(value)) throw new HttpError(400, 'attachment_ids must be a list.')
+  const ids = [...new Set(value.map(String))]
+  if (ids.some((id) => !UUID.test(id))) throw new HttpError(400, 'Invalid attachment id.')
+  if (ids.length > MAX_ATTACHMENTS) {
+    throw new HttpError(400, `You can attach up to ${MAX_ATTACHMENTS} files per message.`)
+  }
+  return ids
+}
+
+/** The message a new one follows: what the browser says, or the end of the branch last viewed. */
+async function pickParent(db: SupabaseClient, body: ChatRequest, conversationId: string): Promise<string | null> {
+  if ('parent_id' in body) {
+    if (body.parent_id === null) return null
+    const id = String(body.parent_id)
+    if (!UUID.test(id)) throw new HttpError(400, 'Invalid parent_id.')
+    const { data, error } = await db.from('chat_messages').select('id').eq('id', id)
+      .eq('conversation_id', conversationId).maybeSingle()
+    if (error) throw dbError(error)
+    if (!data) throw new HttpError(409, 'The message you replied to no longer exists. Reload the chat.')
+    return data.id
+  }
+  const { data: conversation } = await db.from('chat_conversations').select('current_leaf_id')
+    .eq('id', conversationId).maybeSingle()
+  const leaf = conversation?.current_leaf_id as string | null | undefined
+  if (leaf) {
+    const { data } = await db.from('chat_messages').select('id').eq('id', leaf).eq('conversation_id', conversationId)
+      .maybeSingle()
+    if (data) return data.id
+  }
+  const { data: last } = await db.from('chat_messages').select('id').eq('conversation_id', conversationId)
+    .order('created_at', { ascending: false }).limit(1).maybeSingle()
+  return last?.id ?? null
+}
+
+async function setLeaf(client: SupabaseClient, conversationId: string, messageId: string) {
+  const { error } = await client.from('chat_conversations').update({ current_leaf_id: messageId }).eq(
+    'id',
+    conversationId,
+  )
+  if (error) console.error('chat: could not save current_leaf_id', error)
+}
+
+async function loadAttachmentsById(db: SupabaseClient, ids: string[]): Promise<AttachmentRow[]> {
+  const { data, error } = await db.from('chat_attachments').select(`${ATTACHMENT_FIELDS}, text_content`).in('id', ids)
+  if (error) throw dbError(error)
+  const byId = new Map((data as AttachmentRow[]).map((a) => [a.id, a]))
+  if (byId.size !== ids.length) {
+    throw new HttpError(400, "Some attached files weren't found. Remove them and attach them again.")
+  }
+  return ids.map((id) => byId.get(id)!)
+}
+
+/** New uploads get linked to the message; files kept from an edited message are copied. */
+async function linkAttachments(db: SupabaseClient, rows: AttachmentRow[], conversationId: string, messageId: string) {
+  const copies: Record<string, unknown>[] = []
+  await Promise.all(rows.map(async (a, position) => {
+    if (a.message_id === null) {
+      if (a.conversation_id && a.conversation_id !== conversationId) {
+        throw new HttpError(400, `"${a.name}" belongs to another chat.`)
+      }
+      const { data, error } = await db.from('chat_attachments')
+        .update({ conversation_id: conversationId, message_id: messageId, position })
+        .eq('id', a.id).is('message_id', null).select('id')
+      if (error) throw dbError(error)
+      if (!data?.length) throw new HttpError(409, `"${a.name}" was already sent. Attach it again.`)
+    } else {
+      if (a.conversation_id !== conversationId) throw new HttpError(400, `"${a.name}" belongs to another chat.`)
+      copies.push({
+        conversation_id: conversationId,
+        message_id: messageId,
+        position,
+        name: a.name,
+        mime: a.mime,
+        size: a.size,
+        kind: a.kind,
+        storage_path: a.storage_path,
+        image_paths: a.image_paths ?? [],
+        text_content: a.text_content ?? null,
+        meta: a.meta ?? {},
+      })
+    }
+  }))
+  if (copies.length) {
+    const { error } = await db.from('chat_attachments').insert(copies)
+    if (error) throw dbError(error)
+  }
+}
+
+/** The messages the model sees: this branch (v3) or the latest messages (older databases). */
+async function loadHistory(db: SupabaseClient, conversationId: string, leaf: string | null): Promise<HistoryRow[]> {
+  if (leaf) {
+    const { data, error } = await db.rpc('chat_message_path', { leaf, max_count: CONTEXT_MAX_MESSAGES })
+    if (error) throw dbError(error)
+    return (data as HistoryRow[]).map((r) => ({ id: r.id, role: r.role, content: r.content }))
+  }
+  const { data, error } = await db
+    .from('chat_messages')
+    .select('role, content')
+    .eq('conversation_id', conversationId)
+    .order('created_at', { ascending: false })
+    .limit(CONTEXT_MAX_MESSAGES)
+  if (error) throw dbError(error)
+  return (data as HistoryRow[]).reverse()
+}
+
+/**
+ * Adds attached files to the user messages that carry them. The newest files are
+ * always included; older ones only while they fit CONTEXT_MAX_FILE_CHARS /
+ * CONTEXT_MAX_IMAGES (the model is told about the ones left out).
+ */
+async function withAttachments(db: SupabaseClient, rows: HistoryRow[], latestId: string) {
+  const ids = rows.filter((r) => r.role === 'user' && r.id).map((r) => r.id!)
+  const byMessage = new Map<string, AttachmentRow[]>()
+  if (ids.length) {
+    const { data, error } = await db.from('chat_attachments').select(ATTACHMENT_FIELDS).in('message_id', ids)
+      .order('position', { ascending: true })
+    if (error) throw dbError(error)
+    for (const a of data as AttachmentRow[]) {
+      if (!byMessage.has(a.message_id!)) byMessage.set(a.message_id!, [])
+      byMessage.get(a.message_id!)!.push(a)
+    }
+  }
+
+  // Decide what fits, newest message first.
+  let charBudget = CONTEXT_MAX_FILE_CHARS
+  let imageBudget = CONTEXT_MAX_IMAGES
+  const textFor = new Map<string, number>() // attachment id → characters to include
+  const imagesFor = new Map<string, string[]>() // attachment id → storage paths to include
+  for (const id of [...ids].reverse()) {
+    for (const a of byMessage.get(id) ?? []) {
+      const latest = id === latestId
+      if (a.text_chars > 0) {
+        const take = latest
+          ? Math.min(a.text_chars, Math.max(charBudget, 2_000))
+          : a.text_chars <= charBudget
+          ? a.text_chars
+          : 0
+        if (take > 0) {
+          textFor.set(a.id, take)
+          charBudget = Math.max(0, charBudget - take)
+        }
+      }
+      const paths = (a.image_paths ?? []).slice(0, latest ? Math.max(imageBudget, 1) : imageBudget)
+      if (paths.length) {
+        imagesFor.set(a.id, paths)
+        imageBudget = Math.max(0, imageBudget - paths.length)
+      }
+    }
+  }
+
+  const texts = new Map<string, string>()
+  if (textFor.size) {
+    const { data, error } = await db.from('chat_attachments').select('id, text_content').in('id', [...textFor.keys()])
+    if (error) throw dbError(error)
+    for (const r of data as Array<{ id: string; text_content: string | null }>) {
+      texts.set(r.id, (r.text_content ?? '').slice(0, textFor.get(r.id)))
+    }
+  }
+  const imageUrls = new Map<string, string | null>()
+  await Promise.all(
+    [...imagesFor.values()].flat().map(async (path) => imageUrls.set(path, await imageDataUrl(db, path))),
+  )
+
+  let imageCount = 0
+  const out: ChatMessage[] = rows.map((row) => {
+    const files = row.id ? byMessage.get(row.id) : undefined
+    if (row.role !== 'user' || !files?.length) return { role: row.role, content: row.content }
+    const blocks: string[] = []
+    const images: ContentPart[] = []
+    for (const a of files) {
+      const attrs = `name="${attr(a.name)}" type="${attr(a.mime)}"${a.meta?.pages ? ` pages="${a.meta.pages}"` : ''}`
+      const note = typeof a.meta?.note === 'string' ? a.meta.note : ''
+      if (a.text_chars > 0) {
+        const body = texts.get(a.id)
+        if (body !== undefined) {
+          const cut = body.length < a.text_chars
+            ? `\n[Only the first ${body.length.toLocaleString('en')} of ${
+              a.text_chars.toLocaleString('en')
+            } characters are included.]`
+            : ''
+          blocks.push(`<attachment ${attrs}>\n${body}${cut}\n</attachment>`)
+        } else {
+          blocks.push(
+            `<attachment ${attrs} omitted="true">Left out to save space. Ask the user to attach it again if you need it.</attachment>`,
+          )
+        }
+      } else if (a.kind === 'file') {
+        blocks.push(
+          `<attachment ${attrs} size="${formatBytes(a.size)}">${
+            note || "This file's contents can't be read here; only its name and type are known."
+          }</attachment>`,
+        )
+      }
+      const paths = imagesFor.get(a.id) ?? []
+      for (const path of paths) {
+        const url = imageUrls.get(path)
+        if (url) images.push({ type: 'image_url', image_url: { url } })
+      }
+      if (a.kind === 'image' && paths.length === 0) {
+        blocks.push(
+          `<attachment ${attrs}>An image the user sent earlier; it is no longer in your context.</attachment>`,
+        )
+      } else if (a.kind === 'image' && paths.some((p) => !imageUrls.get(p))) {
+        blocks.push(`<attachment ${attrs}>This image couldn't be loaded.</attachment>`)
+      }
+    }
+    imageCount += images.length
+    const textPart = [...blocks, row.content].filter(Boolean).join('\n\n')
+    if (!images.length) return { role: 'user', content: textPart }
+    return { role: 'user', content: [...(textPart ? [{ type: 'text' as const, text: textPart }] : []), ...images] }
+  })
+  return { messages: mergeTurns(out), imageCount }
+}
+
+async function imageDataUrl(db: SupabaseClient, path: string): Promise<string | null> {
+  const { data, error } = await db.storage.from(BUCKET).download(path)
+  if (error || !data) {
+    console.error('chat: could not load image', path, error)
+    return null
+  }
+  const ext = path.split('.').pop()?.toLowerCase() ?? ''
+  const byExt: Record<string, string> = {
+    png: 'image/png',
+    gif: 'image/gif',
+    webp: 'image/webp',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+  }
+  const mime = data.type?.startsWith('image/') ? data.type : byExt[ext] ?? 'image/jpeg'
+  return `data:${mime};base64,${toBase64(new Uint8Array(await data.arrayBuffer()))}`
+}
+
+function toBase64(bytes: Uint8Array): string {
+  let binary = ''
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+  return btoa(binary)
+}
+
+const attr = (value: string) => value.replace(/[\r\n]+/g, ' ').replaceAll('"', "'").slice(0, 255)
+
+function formatBytes(n: number): string {
+  if (n >= 1_048_576) return `${(n / 1_048_576).toFixed(1)} MB`
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`
+  return `${n} bytes`
 }
 
 /** Settings → Memory → "Tell the assistant what to change", and memory import. */
@@ -413,8 +763,8 @@ async function searchPastChats(db: SupabaseClient, text: string, conversationId:
     .join('\n')
 }
 
-/** Keep the newest messages that fit the budget, oldest first. */
-function fitHistory(rows: HistoryRow[]): ChatMessage[] {
+/** Keep the newest messages that fit the budget, oldest first, starting with a user turn. */
+function fitHistory(rows: HistoryRow[]): HistoryRow[] {
   const kept: HistoryRow[] = []
   let chars = 0
   for (let i = rows.length - 1; i >= 0; i--) {
@@ -423,14 +773,25 @@ function fitHistory(rows: HistoryRow[]): ChatMessage[] {
     kept.unshift(rows[i])
     chars += length
   }
-  // Some providers require the first turn to be the user's, and dislike two
-  // turns in a row from the same role (e.g. after a failed reply). Tidy up.
-  while (kept.length > 0 && kept[0].role !== 'user') kept.shift()
+  // Some providers require the first turn to be the user's.
+  while (kept.length > 1 && kept[0].role !== 'user') kept.shift()
+  return kept
+}
+
+/** Providers dislike two turns in a row from the same role (e.g. after a failed reply). Merge them. */
+function mergeTurns(messages: ChatMessage[]): ChatMessage[] {
   const merged: ChatMessage[] = []
-  for (const row of kept) {
+  const parts = (c: string | ContentPart[]): ContentPart[] =>
+    typeof c === 'string' ? (c ? [{ type: 'text', text: c }] : []) : c
+  for (const message of messages) {
     const last = merged[merged.length - 1]
-    if (last && last.role === row.role) last.content += `\n\n${row.content}`
-    else merged.push({ role: row.role, content: row.content })
+    if (!last || last.role !== message.role) {
+      merged.push({ ...message })
+    } else if (typeof last.content === 'string' && typeof message.content === 'string') {
+      last.content = [last.content, message.content].filter(Boolean).join('\n\n')
+    } else {
+      last.content = [...parts(last.content), ...parts(message.content)]
+    }
   }
   return merged
 }
@@ -599,6 +960,8 @@ function streamReply(opts: {
   userId: string
   model: string
   conversationId: string
+  parentId: string | null
+  hasImages: boolean
   meta: StreamEvent
   messages: ChatMessage[]
   saveWith: SupabaseClient
@@ -633,7 +996,7 @@ function streamReply(opts: {
         heartbeat = setInterval(() => write(': ping\n\n'), HEARTBEAT_EVERY_MS)
         send(opts.meta)
 
-        const saver = createSaver(opts)
+        const saver = createSaver(opts, (id) => send({ type: 'saved', message_id: id }))
         let content = ''
         let usage: Usage | null = null
         let finishReason: string | null = null
@@ -643,7 +1006,7 @@ function streamReply(opts: {
         try {
           const res = await callModel(opts.model, opts.messages, upstreamAbort.signal)
           if (!res.ok || !res.body) {
-            errorMessage = await describeUpstreamError(res)
+            errorMessage = await describeUpstreamError(res, opts.hasImages)
           } else {
             for await (const data of readSSE(res.body)) {
               if (data === '[DONE]') break
@@ -690,7 +1053,14 @@ function streamReply(opts: {
             ? "The provider's content filter blocked this reply."
             : 'The model returned an empty reply. Try again or pick another model.'
         }
-        const promptChars = opts.messages.reduce((n, m) => n + m.content.length, 0)
+        const promptChars = opts.messages.reduce(
+          (n, m) =>
+            n +
+            (typeof m.content === 'string'
+              ? m.content.length
+              : m.content.reduce((k, p) => k + (p.type === 'text' ? p.text.length : 4_000), 0)),
+          0,
+        )
         const saved = await saver.finish(content, { usage, finishReason, promptChars })
         if (errorMessage) send({ type: 'error', message: errorMessage })
         send({ type: 'done', message_id: saved.id, saved: saved.ok, finish_reason: finishReason })
@@ -732,7 +1102,16 @@ function streamReply(opts: {
 }
 
 /** Writes the reply to the database while it streams, so a cut-off stream still leaves most of it saved. */
-function createSaver(opts: { userId: string; model: string; conversationId: string; saveWith: SupabaseClient }) {
+function createSaver(
+  opts: {
+    userId: string
+    model: string
+    conversationId: string
+    parentId: string | null
+    saveWith: SupabaseClient
+  },
+  onFirstSave?: (id: string) => void,
+) {
   let messageId: string | null = null
   let lastCheckpoint = 0
   let ok = true
@@ -747,12 +1126,15 @@ function createSaver(opts: { userId: string; model: string; conversationId: stri
           user_id: opts.userId,
           role: 'assistant',
           model: opts.model,
+          ...(opts.parentId ? { parent_id: opts.parentId } : {}),
           ...fields,
         })
         .select('id')
         .single()
       if (error) throw error
       messageId = data.id
+      if (opts.parentId) await setLeaf(opts.saveWith, opts.conversationId, data.id)
+      onFirstSave?.(data.id)
     } else {
       const { error } = await opts.saveWith.from('chat_messages').update(fields).eq('id', messageId)
       if (error) throw error
@@ -831,7 +1213,7 @@ async function* readSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<string
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-async function describeUpstreamError(res: Response): Promise<string> {
+async function describeUpstreamError(res: Response, hadImages = false): Promise<string> {
   let detail = ''
   try {
     const raw = (await res.text()).slice(0, 4000)
@@ -851,7 +1233,10 @@ async function describeUpstreamError(res: Response): Promise<string> {
   }
   detail = detail.trim().slice(0, 600)
   if (detail && !/[.!?]$/.test(detail)) detail += '.'
-  return [`Model API error ${res.status}${detail ? `: ${detail}` : '.'}`, hints[res.status]].filter(Boolean).join(' ')
+  const hint = hadImages && [400, 404, 413, 415, 422].includes(res.status)
+    ? 'This model may not accept images, or the images are too large. Try a model that can see images (Claude, GPT, Gemini).'
+    : hints[res.status]
+  return [`Model API error ${res.status}${detail ? `: ${detail}` : '.'}`, hint].filter(Boolean).join(' ')
 }
 
 function upstreamMessage(error: unknown): string {
@@ -868,7 +1253,7 @@ function upstreamMessage(error: unknown): string {
 function dbError(error: { message: string; code?: string }): HttpError {
   console.error('chat: database error', error)
   const hint = error.code === 'PGRST205' || error.code === '42P01'
-    ? ' Did you run supabase/schema.sql (and upgrade-v2.sql)?'
+    ? ' Did you run supabase/schema.sql (and the upgrade files)?'
     : error.code === '42501'
     ? ' Check the grants and policies from supabase/schema.sql.'
     : ''

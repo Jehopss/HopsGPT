@@ -1,6 +1,6 @@
 # Minimal Chat
 
-Website chatbot minimalis: login, banyak chat, pilih model, history + konteks tersimpan di Supabase.
+Website chatbot minimalis: login, banyak chat, pilih model, lampiran file, history + konteks tersimpan di Supabase.
 API key model **nggak pernah sampai ke browser**: disimpan di Edge Function secrets.
 
 ![Preview](docs/preview.png)
@@ -10,17 +10,25 @@ minimal-chat/
 ├── supabase/
 │   ├── schema.sql              ← tabel + Row Level Security (install baru: jalankan ini aja)
 │   ├── upgrade-v2.sql          ← buat yang udah install versi pertama
+│   ├── upgrade-v3.sql          ← buat yang udah install v2 (file, edit, retry)
 │   └── functions/chat/index.ts ← Edge Function: panggil model, stream, simpan history, memory
 └── web/                        ← frontend statis (tanpa build)
     ├── index.html
     ├── style.css
     ├── app.js
     ├── artifacts.js            ← panel artifact (preview HTML/SVG/dokumen)
+    ├── files.js                ← baca lampiran di browser (PDF, Word, Excel, PowerPoint, video, …)
+    ├── tree.js                 ← versi pesan (edit & retry)
+    ├── ambient.js              ← animasi background waktu chat masih kosong
     └── config.js               ← isi URL + key Supabase + daftar model + harga di sini
 
 ## Fitur
 
 - **Chat + history** tersimpan di Supabase, pilih model per pesan, streaming, tombol Stop, markdown
+- **Lampiran file** (tombol 📎, paste, atau drag & drop, maksimal 10 file per pesan): gambar, PDF (termasuk hasil scan), Word, Excel, PowerPoint, OpenDocument, EPUB, CSV, kode, ZIP, video. Detailnya di bagian **Lampiran file** di bawah
+- **Edit** pesan lo dan **Retry** balasan (pakai model yang lagi dipilih). Versi lama nggak hilang: pindah-pindah pakai ‹ 1/2 ›, dan chat kebuka lagi di versi terakhir yang lo lihat
+- **Copy** pesan lo, balasan, dan tiap blok kode
+- **Animasi background** di layar chat baru (titik-titik yang bergelombang pelan, ikut gerak kursor). Diem kalau di HP/laptop lo nyalain "reduce motion"
 - **Artifacts**: model bisa bikin halaman web, app kecil, SVG, atau dokumen panjang yang muncul di panel samping (Preview / Code, versi v1–v2–v3, Copy, Download). Preview jalan di iframe terisolasi, jadi kodenya nggak bisa ngakses login atau data lo
 - **Settings** ala Claude:
   - **General**: tema (System/Light/Dark), notifikasi browser pas balasan selesai, instruksi buat semua chat
@@ -63,8 +71,8 @@ Id model yang persis bisa dicek di dokumentasi provider masing-masing (OpenRoute
 
 ### 2. Bikin tabel
 **SQL Editor** → **New query** → paste seluruh isi `supabase/schema.sql` → **Run**.
-(File ini udah termasuk semua fitur v2. `upgrade-v2.sql` cuma buat yang install versi pertama, lihat bagian **Update ke v2** di bawah.)
-Harusnya muncul "Success". Tabel `chat_conversations`, `chat_messages`, dan `chat_settings` sekarang ada di **Table Editor**.
+(File ini udah termasuk semua fitur v2 dan v3, termasuk bucket Storage `chat-files` buat lampiran. `upgrade-v2.sql` / `upgrade-v3.sql` cuma buat yang install versi lama, lihat bagian **Update** di bawah.)
+Harusnya muncul "Success". Tabel `chat_conversations`, `chat_messages`, `chat_settings`, `chat_memories`, dan `chat_attachments` sekarang ada di **Table Editor**, dan bucket `chat-files` di **Storage**.
 
 ### 3. Deploy Edge Function
 **Edge Functions** → **Deploy a new function** → **Via Editor**.
@@ -107,21 +115,46 @@ Buka URL-nya → login → chat.
 
 ---
 
-## Update ke v2 (kalau udah pakai versi pertama)
+## Update
 
-1. **Database**: SQL Editor → paste isi `supabase/upgrade-v2.sql` → **Run**. Aman dijalanin lebih dari sekali, data lama nggak kesentuh.
+### Ke v3: file, edit, retry (kalau udah pakai v2)
+
+1. **Database**: SQL Editor → paste isi `supabase/upgrade-v3.sql` → **Run**. File ini bikin tabel `chat_attachments`, bucket Storage `chat-files` (private, maks 25 MB per file), dan nyambungin pesan-pesan lama jadi satu alur. Aman dijalanin lebih dari sekali.
 2. **Edge Function**: Edge Functions → `chat` → **Code** → ganti seluruh isinya dengan `supabase/functions/chat/index.ts` yang baru → **Deploy**.
-3. **Frontend**: timpa folder `web/` di repo lo (ada file baru `artifacts.js`), terus `git add .` → `git commit` → `git push`. Cloudflare Pages deploy otomatis.
-4. **Opsional**: tambah secret `MEMORY_MODEL` = model murah buat update memory, misalnya `deepseek-v4-flash` atau `gemini-3.6-flash`. Tanpa ini, memory pakai model yang sama dengan chat.
+3. **Frontend**: timpa folder `web/` di repo lo (ada file baru `files.js`, `tree.js`, `ambient.js`), terus `git add .` → `git commit` → `git push`. Cloudflare Pages deploy otomatis.
 
-Kalau langkah 1 belum dijalankan, app tetap jalan, tapi Settings nampilin banner kuning dan Usage/Memory/Search dimatiin dulu.
+Kalau langkah 1 kelewat, chat biasa tetap jalan. Tombol lampiran, Edit, dan Retry bakal ngasih tahu buat jalanin `upgrade-v3.sql` dulu.
+
+### Ke v2 (kalau masih versi pertama)
+
+Jalanin `supabase/upgrade-v2.sql` dulu, baru `upgrade-v3.sql`, terus langkah 2 & 3 di atas. Opsional: tambah secret `MEMORY_MODEL` = model murah buat update memory, misalnya `deepseek-v4-flash`. Tanpa ini, memory pakai model yang sama dengan chat.
+
+## Lampiran file
+
+File dibaca **di browser lo**, terus yang dikirim ke model adalah hal yang dia ngerti:
+
+| File | Yang diterima model |
+|---|---|
+| Gambar (PNG, JPG, WebP, GIF, HEIC di Safari, …) | Gambarnya. Yang gede diperkecil ke maks 2048 px biar hemat token |
+| PDF | Teks tiap halaman. PDF hasil scan (nggak ada teksnya) → 10 halaman pertama dikirim sebagai gambar |
+| Word, Excel, PowerPoint (`docx`, `xlsx`, `pptx`), OpenDocument, EPUB | Teksnya: judul, list, tabel, isi tiap sheet (CSV), isi tiap slide + speaker notes |
+| Kode, CSV, JSON, Markdown, TXT, HTML, SVG, log, … | Isinya apa adanya |
+| ZIP | Daftar file di dalamnya + isi file-file teksnya (`node_modules`, `.git`, dll. dilewatin) |
+| Video (MP4, WebM, MOV, …) | Sampai 8 frame dari sepanjang video, sebagai gambar (tanpa suara) |
+| Audio, `.doc`/`.xls`/`.ppt` lama, file biner lain | Cuma nama, tipe, dan ukurannya (ditandai "name only") |
+
+- Maksimal **10 file per pesan**. File asli disimpan di Storage (maks 25 MB). File yang lebih gede (sampai 250 MB) tetap dibaca, tapi yang disimpan cuma hasil bacaannya.
+- Gambar cuma kebaca sama model yang bisa lihat gambar (Claude, GPT, Gemini, dll.). Kalau modelnya nolak, pesan error-nya bakal bilang. Tinggal ganti model terus pencet **Retry**.
+- Di pesan-pesan berikutnya, model masih "ingat" file-file itu: teks file terbaru dikirim ulang sampai ±150.000 karakter, dan maks 10 gambar terakhir (bisa diatur, lihat `CONTEXT_MAX_FILE_CHARS` / `CONTEXT_MAX_IMAGES`).
+- Hapus chat = file-filenya ikut kehapus dari Storage. File yang ke-upload tapi nggak jadi dikirim (misalnya tab-nya ketutup) dihapus otomatis waktu lo buka app lagi, kalau udah lebih dari sehari.
+- Storage gratis Supabase 1 GB, cek pemakaiannya di **Storage** di Dashboard.
 
 ## Cara kerja history & konteks
 
 Model AI itu **stateless**: tiap request dia lupa semuanya. Jadi tiap kamu kirim pesan, function-nya:
 
-1. Simpan pesan kamu ke `chat_messages`
-2. Ambil history chat itu dari database (default: 40 pesan terakhir, maksimal ±60.000 karakter)
+1. Simpan pesan kamu ke `chat_messages` (plus file yang dilampirkan)
+2. Ambil history chat itu dari database: versi yang lagi lo lihat aja, versi lain hasil edit/retry nggak ikut (default: 40 pesan terakhir, maksimal ±60.000 karakter, plus isi file)
 3. Susun konteks: **system prompt** (termasuk tanggal hari ini) + **instruksi buat semua chat** (Settings → General) + **Memory** (fakta tentang lo yang udah diingat) + potongan **chat lama yang relevan** (kalau "Search and reference chats" nyala) + **Instructions** chat ini (tombol di kolom ketik) + aturan artifact + history
 4. Kirim ke model, stream balasan ke browser, sambil **nyimpen balasan tiap ±2 detik**. Jadi kalau koneksi putus di tengah jalan, sebagian besar balasan tetap tersimpan
 5. Setelah balasan selesai (dan kalau Memory nyala), model ngecek ada fakta baru tentang lo yang perlu diingat. Ini jalan di background, jadi nggak bikin balasan lebih lama
@@ -142,6 +175,8 @@ Pesan yang lebih lama dari batas di atas nggak ikut dikirim (masih tersimpan, cu
 | `CONTEXT_MAX_CHARS` | `60000` | Batas karakter history yang dikirim |
 | `MAX_OUTPUT_TOKENS` | default provider | Batas panjang balasan |
 | `MEMORY_MODEL` | model chat | Model buat update memory di background (pakai yang murah) |
+| `CONTEXT_MAX_FILE_CHARS` | `150000` | Berapa karakter isi file (PDF, Word, …) yang dikirim ulang ke model tiap pesan |
+| `CONTEXT_MAX_IMAGES` | `10` | Berapa gambar terakhir (termasuk frame video & halaman scan) yang dikirim ulang ke model |
 
 Ganti/tambah model di picker: edit `MODELS` di `web/config.js` (model pertama = default).
 
@@ -149,6 +184,7 @@ Ganti/tambah model di picker: edit `MODELS` di `web/config.js` (model pertama = 
 
 - API key model cuma ada di Edge Function secrets, nggak pernah dikirim ke browser.
 - Row Level Security: tiap user cuma bisa baca/ubah chat miliknya sendiri.
+- File disimpan di bucket **private**: tiap user cuma bisa buka folder miliknya sendiri, dan gambar ditampilkan lewat link sementara (kadaluarsa 1 jam). Teks hasil bacaan file disimpan di tabel `chat_attachments`.
 - Function nolak request tanpa login, dan (kalau `ALLOWED_EMAILS` diisi) email yang nggak terdaftar.
 - Output model di-sanitize sebelum ditampilkan, jadi HTML/script dari balasan nggak bisa jalan. Gambar di balasan ditampilkan sebagai link, bukan di-load otomatis.
 
@@ -164,6 +200,10 @@ Ganti/tambah model di picker: edit `MODELS` di `web/config.js` (model pertama = 
 | "… is not a valid model ID" / error 404 | Id model nggak cocok sama provider-nya (lihat tabel di atas) |
 | "This account is not allowed to use this chat" | Email kamu belum ada di `ALLOWED_EMAILS` |
 | "Your session has expired" | Sign out lalu login lagi |
+| "Files, editing and retrying need a database update" | Jalanin `supabase/upgrade-v3.sql` (bagian **Update**) |
+| "This model may not accept images…" | Model yang dipilih nggak bisa lihat gambar. Ganti model (Claude/GPT/Gemini) terus pencet **Retry** |
+| File nyangkut di "Reading…" lama / "took too long" | File-nya kegedean atau rusak. Coba file yang lebih kecil, atau simpan ulang (misalnya `.doc` → `.docx`) |
+| "Storage didn't allow the upload" / "Bucket not found" | Jalanin ulang `supabase/upgrade-v3.sql` |
 | "The connection closed before the reply finished" | Balasan kelamaan. Edge Function di plan Free dibatasi 150 detik per request, dan bagian yang sudah keluar tetap tersimpan |
 
 Log lengkap: **Edge Functions** → `chat` → **Logs**.

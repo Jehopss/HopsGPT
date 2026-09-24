@@ -4,6 +4,9 @@ import { marked } from 'https://cdn.jsdelivr.net/npm/marked@18.0.13/lib/marked.e
 import DOMPurify from 'https://cdn.jsdelivr.net/npm/dompurify@3.4.15/dist/purify.es.mjs'
 import * as config from './config.js'
 import { artifactCard, collectArtifacts, createArtifactPanel, plainText, splitReply } from './artifacts.js'
+import { extOf, formatSize, MAX_FILES, readAttachment, storageName, typeLabel } from './files.js'
+import { addMessage, branchFor, createTree, lastLeaf, pathTo, siblingsOf, treeFrom } from './tree.js'
+import { createAmbient } from './ambient.js'
 
 window.chatReady = true
 
@@ -18,6 +21,10 @@ const SUPABASE_KEY = String(config.SUPABASE_PUBLISHABLE_KEY ?? '')
 const CHAT_URL = `${SUPABASE_URL}/functions/v1/chat`
 const ALLOW_SIGN_UP = config.ALLOW_SIGN_UP !== false
 const CONVERSATION_FIELDS = 'id, title, model, system_prompt, updated_at'
+const MESSAGE_FIELDS = 'id, role, content, model, finish_reason, created_at'
+const ATTACHMENT_FIELDS = 'id, message_id, name, mime, size, kind, storage_path, image_paths, position, meta'
+const BUCKET = 'chat-files'
+const UPGRADE_V3 = 'Files, editing and retrying need a database update: run supabase/upgrade-v3.sql in the SQL Editor.'
 const IS_TOUCH = window.matchMedia('(pointer: coarse)').matches
 
 const $ = (id) => document.getElementById(id)
@@ -30,6 +37,9 @@ const ui = {
   account: $('account-btn'), avatar: $('avatar'), accountEmail: $('account-email'),
   main: $('main'), title: $('chat-title'), messages: $('messages'), thread: $('thread'),
   composer: $('composer'), input: $('input'), model: $('model'), send: $('send'), instructionsBtn: $('instructions-btn'),
+  attachBtn: $('attach-btn'), fileInput: $('file-input'), composerFiles: $('composer-files'), ambient: $('ambient'),
+  lightbox: $('lightbox'), lightboxImg: $('lightbox-img'), lightboxName: $('lightbox-name'),
+  lightboxDownload: $('lightbox-download'), lightboxClose: $('lightbox-close'),
   instructionsDialog: $('instructions-dialog'), instructionsText: $('instructions-text'),
   search: $('chat-search'),
   settingsDialog: $('settings-dialog'), settingsClose: $('settings-close'), settingsUpgrade: $('settings-upgrade'),
@@ -76,13 +86,16 @@ const state = {
   user: null,
   conversations: [], // newest first
   current: null, // the chat on screen, or null for a new chat
-  messages: [], // messages of the chat on screen
+  messages: [], // the branch of the chat on screen, first message → last
+  tree: createTree(), // every message of the chat on screen, incl. other versions (edits, retries)
+  composerFiles: [], // files attached to the message being written
   draftInstructions: '', // instructions for a chat that doesn't exist yet
   customInstructions: '',
   prefs: {}, // chat_settings.preferences: { artifacts, memory, referenceChats, monthlyBudget }
   v2: true, // false until supabase/upgrade-v2.sql has been run
+  v3: true, // false until supabase/upgrade-v3.sql has been run (files, edit, retry)
   memories: [],
-  stream: null, // { controller, messages, reply, el, conversationId, instructions, autoOpened, finalized }
+  stream: null, // { controller, messages, tree, reply, userMessage, el, conversationId, instructions, autoOpened, finalized }
   loadSeq: 0,
   searchSeq: 0,
 }
@@ -167,8 +180,9 @@ async function onSession(session) {
   ui.accountEmail.textContent = session.user.email ?? ''
   ui.avatar.textContent = (session.user.email ?? '?').charAt(0)
   show('app')
-  await Promise.all([loadConversations(), loadSettings()])
+  await Promise.all([loadConversations(), loadSettings(), detectV3()])
   route()
+  if (state.v3) cleanUpUnsentFiles()
 }
 
 function show(view) {
@@ -176,16 +190,20 @@ function show(view) {
   ui.setup.hidden = view !== 'setup'
   ui.auth.hidden = view !== 'auth'
   ui.app.hidden = view !== 'app'
+  if (view !== 'app') ambient.stop()
   if (view === 'auth' && !IS_TOUCH) ui.authEmail.focus()
 }
 
 function resetState() {
   state.stream?.controller.abort()
+  for (const item of state.composerFiles) if (item.preview) URL.revokeObjectURL(item.preview)
   Object.assign(state, {
     user: null,
     conversations: [],
     current: null,
     messages: [],
+    tree: createTree(),
+    composerFiles: [],
     draftInstructions: '',
     customInstructions: '',
     prefs: {},
@@ -198,6 +216,8 @@ function resetState() {
   ui.search.value = ''
   ui.thread.replaceChildren()
   ui.chatList.replaceChildren()
+  renderComposerFiles()
+  signedUrls.clear()
   if (location.hash) history.replaceState(null, '', location.pathname + location.search)
 }
 
@@ -281,7 +301,16 @@ async function savePrefs(patch) {
   return false
 }
 
+/** Whether supabase/upgrade-v3.sql has been run. */
+async function detectV3() {
+  const { error } = await supabase.from('chat_attachments').select('id').limit(1)
+  state.v3 = !['PGRST205', '42P01', 'PGRST204', '42703'].includes(error?.code ?? '')
+}
+
 function dbHint(error) {
+  if (/chat_attachments|parent_id|current_leaf_id|chat_message_path|[Bb]ucket not found/.test(error.message ?? '')) {
+    return 'Run supabase/upgrade-v3.sql in the SQL Editor first.'
+  }
   if (/chat_memories|preferences|chat_usage|search_chat_messages|tokens_estimated/.test(error.message ?? '')) {
     return 'Run supabase/upgrade-v2.sql in the SQL Editor first.'
   }
@@ -314,6 +343,7 @@ function startNewChat() {
   // A brand-new chat that is still streaming (no id yet) stays visible.
   const pending = state.stream && state.stream.conversationId === null
   state.messages = pending ? state.stream.messages : []
+  state.tree = pending ? state.stream.tree : createTree()
   if (!pending) state.draftInstructions = ''
   ui.title.value = ''
   ui.title.disabled = true
@@ -349,58 +379,139 @@ async function openChat(id) {
 
   if (state.stream?.conversationId === id) {
     state.messages = state.stream.messages // still streaming: show the live reply
+    state.tree = state.stream.tree
     renderThread()
     scrollToBottom()
     return
   }
 
   state.messages = []
-  ui.main.classList.remove('is-empty')
+  state.tree = createTree()
+  setEmpty(false)
   ui.thread.innerHTML = '<div class="thread-loading" aria-hidden="true"><span></span><span></span><span></span></div>'
   updateComposer()
-  const { data, error } = await supabase
-    .from('chat_messages')
-    .select('id, role, content, model, finish_reason')
-    .eq('conversation_id', id)
-    .order('created_at', { ascending: true })
-  if (seq !== state.loadSeq) return
-  if (error) {
-    ui.thread.replaceChildren(el('div', 'msg-error', `Couldn't load this chat. ${dbHint(error)}`))
+  let loaded
+  try {
+    loaded = await loadChat(id)
+  } catch (err) {
+    if (seq !== state.loadSeq) return
+    ui.thread.replaceChildren(el('div', 'msg-error', `Couldn't load this chat. ${err.message}`))
     return
   }
-  state.messages = data
+  if (seq !== state.loadSeq) return
+  state.tree = loaded.tree
+  state.messages = branchFor(loaded.tree, loaded.leaf)
   renderThread()
   scrollToBottom()
   focusInput()
 }
 
+/** Every message of a chat (all versions), its files, and the branch viewed last. */
+async function loadChat(id) {
+  const fields = state.v3 ? `${MESSAGE_FIELDS}, parent_id` : MESSAGE_FIELDS
+  const [rows, files, leaf] = await Promise.all([
+    fetchAll(() => supabase.from('chat_messages').select(fields).eq('conversation_id', id).order('created_at', { ascending: true })),
+    state.v3
+      ? fetchAll(() => supabase.from('chat_attachments').select(ATTACHMENT_FIELDS).eq('conversation_id', id).order('position', { ascending: true }))
+      : [],
+    state.v3
+      ? supabase.from('chat_conversations').select('current_leaf_id').eq('id', id).maybeSingle().then((r) => r.data?.current_leaf_id ?? null)
+      : null,
+  ])
+  const byMessage = new Map()
+  for (const file of files) {
+    if (!byMessage.has(file.message_id)) byMessage.set(file.message_id, [])
+    byMessage.get(file.message_id).push(file)
+  }
+  for (const row of rows) row.attachments = byMessage.get(row.id) ?? []
+  return { tree: treeFrom(rows, { linear: !state.v3 }), leaf }
+}
+
 // ── Sending & streaming ──────────────────────────────────────────────────────
+
+const isBusy = (item) => item.status === 'reading' || item.status === 'uploading'
 
 async function send() {
   const text = ui.input.value.trim()
-  if (!text) return
+  const items = state.composerFiles
+  const ready = items.filter((item) => item.status === 'ready')
+  if (!text && !ready.length) return
+  if (items.some(isBusy)) return toast('Wait for your files to finish uploading.')
   if (state.stream) {
     if (state.stream.messages !== state.messages) toast('Wait for the other reply to finish first.')
     return
   }
+  const failed = items.filter((item) => item.status === 'error')
+  const turn = runTurn({ text, files: ready.map(sentFile) })
+  ui.input.value = ''
+  state.composerFiles = []
+  autosize()
+  renderComposerFiles()
+  if (failed.length) {
+    toast(`${failed.map((f) => `“${f.name}”`).join(', ')} couldn't be attached, so ${failed.length === 1 ? 'it was' : 'they were'} left out.`)
+  }
+  await turn
+}
+
+/**
+ * Sends a message and streams the reply. Also used for an edited message
+ * (`edit`: the message it replaces, which stays as an older version) and for
+ * Retry (`retry`: the user message to answer again, with the model picked now).
+ */
+async function runTurn({ text = '', files = [], edit = null, retry = null }) {
   const conversation = state.current
   const model = ui.model.value
   const reply = { role: 'assistant', content: '', model, pending: true }
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone
+  let path
+  let userMessage
+  let body
+  if (retry) {
+    userMessage = retry
+    path = [...state.messages.slice(0, state.messages.indexOf(retry) + 1), reply]
+    body = { action: 'regenerate', conversation_id: conversation.id, message_id: retry.id, model, timezone }
+  } else {
+    const base = edit ? state.messages.slice(0, state.messages.indexOf(edit)) : state.messages
+    userMessage = { role: 'user', content: text, attachments: files, pending: true }
+    path = [...base, userMessage, reply]
+    body = { conversation_id: conversation?.id ?? null, message: text, model, timezone }
+    if (!conversation && state.draftInstructions) body.system_prompt = state.draftInstructions
+    if (files.length) body.attachment_ids = files.map((f) => f.id)
+    if (conversation && state.v3) {
+      // Reply to what's on screen: the end of this branch, or (edit) the message before the edited one.
+      // If the last reply was never confirmed (e.g. cut off), the server continues from the newest saved one.
+      const last = base.at(-1)
+      if (edit?.id) body.parent_id = edit.parent_id ?? null
+      else if (!last || last.id) body.parent_id = last?.id ?? null
+    }
+  }
   const stream = {
     controller: new AbortController(),
-    messages: state.messages,
+    messages: path,
+    tree: state.tree,
     reply,
+    userMessage,
+    retry: Boolean(retry),
     el: null,
     conversationId: conversation?.id ?? null,
     instructions: conversation ? null : state.draftInstructions,
   }
-  state.messages.push({ role: 'user', content: text }, reply)
+  state.messages = path
   state.stream = stream
-  ui.input.value = ''
-  autosize()
   renderThread()
   scrollToBottom()
   announce('Waiting for the reply…')
+
+  // The reply joins the chat's tree once it's saved (its id arrives before it's finished).
+  const keepReply = (id) => {
+    if (!id || reply.id) return
+    reply.id = id
+    if (!state.v3) return
+    reply.parent_id = userMessage.id
+    addMessage(stream.tree, reply)
+    const node = nodeFor.get(reply)
+    if (node) node.dataset.id = id
+  }
 
   let finished = false
   // The reply is "done" as soon as its text is complete. The connection may stay
@@ -409,26 +520,22 @@ async function send() {
     if (stream.finalized) return
     stream.finalized = true
     reply.pending = false
+    userMessage.pending = false
     if (state.stream === stream) state.stream = null
-    if (stream.el?.isConnected) {
+    if (state.messages === stream.messages) {
+      // Repaint the whole branch: version counters (‹ 2/2 ›) and actions change now.
       const stick = nearBottom()
-      paintMessage(reply, stream.el)
+      const top = ui.messages.scrollTop
+      renderThread()
       if (stick) scrollToBottom()
-    }
-    if (state.messages === stream.messages) artifactPanel.update(state.messages)
-    updateComposer()
+      else ui.messages.scrollTop = top
+    } else updateComposer()
     announce(reply.error ? 'The reply failed.' : 'Reply finished.')
     if (!reply.error && reply.content && reply.finish_reason !== 'stopped') notifyReply(reply)
   }
 
   try {
-    const res = await callFunction({
-      conversation_id: conversation?.id ?? null,
-      message: text,
-      model,
-      system_prompt: stream.instructions || undefined,
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    }, stream.controller.signal)
+    const res = await callFunction(body, stream.controller.signal)
     if (!res.ok || !res.headers.get('content-type')?.includes('text/event-stream')) {
       throw new Error(await responseError(res))
     }
@@ -440,11 +547,12 @@ async function send() {
       } else if (event.type === 'delta') {
         reply.content += event.text
         queuePaint()
-      } else if (event.type === 'error') reply.error = event.message
+      } else if (event.type === 'saved') keepReply(event.message_id)
+      else if (event.type === 'error') reply.error = event.message
       else if (event.type === 'done') {
         finished = true
-        reply.id = event.message_id
         reply.finish_reason = event.finish_reason
+        keepReply(event.message_id)
         if (!event.saved) reply.warning = "This reply couldn't be saved to your history."
         finalize()
       } else if (event.type === 'memory') onMemoryUpdated(event.changes)
@@ -483,6 +591,17 @@ function stop() {
 function onMeta(event, stream) {
   stream.conversationId = event.conversation_id
   const viewing = state.messages === stream.messages
+  if (!stream.retry) {
+    const message = stream.userMessage
+    message.id = event.user_message_id
+    message.parent_id = event.parent_id ?? null
+    message.pending = false
+    if (state.v3) addMessage(stream.tree, message)
+    if (viewing && siblingsOf(stream.tree, message).length > 1) {
+      const node = nodeFor.get(message)
+      if (node?.isConnected) paintMessage(message, node) // an edit: show ‹ 2/2 › right away
+    }
+  }
   if (event.created) {
     const conversation = {
       id: event.conversation_id,
@@ -557,21 +676,41 @@ function friendlyError(err) {
 
 // ── Rendering ────────────────────────────────────────────────────────────────
 
+const nodeFor = new WeakMap() // message → its element in the thread
+
 function renderThread() {
   ui.thread.replaceChildren(...state.messages.map((message) => {
     const node = el('div', `msg ${message.role}`)
+    if (message.id) node.dataset.id = message.id
+    nodeFor.set(message, node)
     paintMessage(message, node)
     if (state.stream?.reply === message) state.stream.el = node
     return node
   }))
-  ui.main.classList.toggle('is-empty', state.messages.length === 0)
+  setEmpty(state.messages.length === 0)
   artifactPanel.update(state.messages)
   updateComposer()
 }
 
+// Background animation on the empty "new chat" screen
+const ambient = createAmbient(ui.ambient)
+let ambientTimer
+
+function setEmpty(empty) {
+  ui.main.classList.toggle('is-empty', empty)
+  clearTimeout(ambientTimer)
+  if (empty && !ui.app.hidden) ambient.start()
+  else ambientTimer = setTimeout(() => ambient.stop(), 700) // after it has faded out
+}
+
 function paintMessage(message, node) {
+  node.classList.remove('editing')
   if (message.role === 'user') {
-    node.replaceChildren(el('div', 'bubble', message.content))
+    const parts = []
+    if (message.attachments?.length) parts.push(messageFiles(message.attachments))
+    if (message.content) parts.push(el('div', 'bubble', message.content))
+    if (!message.pending) parts.push(userActions(message))
+    node.replaceChildren(...parts)
     return
   }
   const parts = []
@@ -600,7 +739,7 @@ function paintMessage(message, node) {
   const note = noteFor(message)
   if (note) parts.push(el('div', 'msg-note', note))
   if (message.error) parts.push(el('div', 'msg-error', message.error))
-  if (!message.pending && message.content) parts.push(messageMeta(message))
+  if (!message.pending && (message.content || message.error || message.finish_reason)) parts.push(messageMeta(message))
   node.replaceChildren(...parts)
 }
 
@@ -614,11 +753,159 @@ function noteFor(message) {
 
 function messageMeta(message) {
   const row = el('div', 'msg-meta')
-  const copy = iconButton('i-copy', 'Copy reply')
-  copy.addEventListener('click', () => copyText(plainText(message.content), copy))
-  row.append(copy)
+  if (message.content) {
+    const copy = iconButton('i-copy', 'Copy reply')
+    copy.addEventListener('click', () => copyText(plainText(message.content), copy))
+    row.append(copy)
+  }
+  const retry = iconButton('i-refresh', 'Retry')
+  const retryLabel = () => {
+    const label = `Retry with ${modelLabel(ui.model.value)}`
+    retry.title = label
+    retry.setAttribute('aria-label', label)
+  }
+  retry.addEventListener('pointerenter', retryLabel)
+  retry.addEventListener('focus', retryLabel)
+  retry.addEventListener('click', () => retryReply(message))
+  row.append(retry)
+  const versions = versionSwitcher(message)
+  if (versions) row.append(versions)
   if (message.model) row.append(el('span', 'msg-model', modelLabel(message.model)))
   return row
+}
+
+function userActions(message) {
+  const row = el('div', 'msg-meta user-meta')
+  const versions = versionSwitcher(message)
+  if (versions) row.append(versions)
+  if (message.content) {
+    const copy = iconButton('i-copy', 'Copy message')
+    copy.addEventListener('click', () => copyText(message.content, copy))
+    row.append(copy)
+  }
+  const edit = iconButton('i-edit', 'Edit message')
+  edit.addEventListener('click', () => startEdit(message))
+  row.append(edit)
+  return row
+}
+
+// ── Versions: edit & retry ───────────────────────────────────────────────────
+
+/** ‹ 2/3 › for a message that has other versions. */
+function versionSwitcher(message) {
+  const siblings = siblingsOf(state.tree, message)
+  if (siblings.length < 2) return null
+  const i = siblings.indexOf(message)
+  const box = el('span', 'versions')
+  const prev = iconButton('i-chevron-left', 'Previous version')
+  const next = iconButton('i-chevron-right', 'Next version')
+  prev.dataset.dir = 'prev'
+  next.dataset.dir = 'next'
+  prev.disabled = i <= 0
+  next.disabled = i >= siblings.length - 1
+  prev.addEventListener('click', () => showVersion(siblings[i - 1], message, 'prev'))
+  next.addEventListener('click', () => showVersion(siblings[i + 1], message, 'next'))
+  const label = el('span', 'versions-label', `${i + 1} / ${siblings.length}`)
+  label.setAttribute('aria-label', `Version ${i + 1} of ${siblings.length}`)
+  box.append(prev, label, next)
+  return box
+}
+
+function showVersion(target, from, dir) {
+  if (!target) return
+  if (state.stream && state.stream.messages === state.messages) return toast('Wait for the reply to finish first.')
+  // Keep the switcher under the pointer: the thread below it changes, the part above doesn't.
+  const before = nodeFor.get(from)?.getBoundingClientRect().top
+  const leaf = lastLeaf(state.tree, target.id)
+  state.messages = pathTo(state.tree, leaf.id)
+  renderThread()
+  const node = nodeFor.get(target)
+  if (node && before !== undefined) ui.messages.scrollTop += node.getBoundingClientRect().top - before
+  const button = node?.querySelector(`.versions [data-dir="${dir}"]`)
+  ;(button && !button.disabled ? button : node?.querySelector('.versions button:not(:disabled)'))?.focus({ preventScroll: true })
+  saveLeaf(leaf.id)
+}
+
+let leafTimer
+/** Remembers the version on screen, so the chat reopens on it (also on your other devices). */
+function saveLeaf(id) {
+  const conversation = state.current
+  if (!conversation || !state.v3 || !id) return
+  clearTimeout(leafTimer)
+  leafTimer = setTimeout(async () => {
+    const { error } = await supabase.from('chat_conversations').update({ current_leaf_id: id }).eq('id', conversation.id)
+    if (error) console.warn('Could not save the version on screen', error)
+  }, 400)
+}
+
+function retryReply(reply) {
+  if (state.stream) return toast('Wait for the reply to finish first.')
+  const i = state.messages.indexOf(reply)
+  const user = state.messages.slice(0, i).findLast((m) => m.role === 'user')
+  if (!user) return
+  if (!user.id) {
+    // The message itself never reached the server: just send it again.
+    state.messages = state.messages.slice(0, state.messages.indexOf(user))
+    runTurn({ text: user.content, files: user.attachments ?? [] })
+    return
+  }
+  if (!state.v3) return toast(UPGRADE_V3)
+  runTurn({ retry: user })
+}
+
+function startEdit(message) {
+  if (state.stream) return toast('Wait for the reply to finish first.')
+  if (message.id && !state.v3) return toast(UPGRADE_V3)
+  const node = nodeFor.get(message)
+  if (!node) return
+  const form = el('form', 'edit-box')
+  const area = el('textarea', 'edit-input')
+  area.value = message.content
+  area.rows = 1
+  area.setAttribute('aria-label', 'Edit message')
+  const grow = () => {
+    area.style.height = 'auto'
+    area.style.height = `${Math.min(area.scrollHeight, 320)}px`
+  }
+  area.addEventListener('input', grow)
+  const cancel = el('button', 'btn', 'Cancel')
+  cancel.type = 'button'
+  const save = el('button', 'btn primary', 'Send')
+  save.type = 'submit'
+  const actions = el('div', 'edit-actions')
+  actions.append(
+    el('span', 'edit-note', 'Sending starts a new version of the chat from here. The current version stays available.'),
+    cancel,
+    save,
+  )
+  if (message.attachments?.length) form.append(messageFiles(message.attachments))
+  form.append(area, actions)
+  node.classList.add('editing')
+  node.replaceChildren(form)
+  grow()
+  area.focus()
+  area.setSelectionRange(area.value.length, area.value.length)
+
+  const close = () => paintMessage(message, node)
+  cancel.addEventListener('click', close)
+  area.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      event.stopPropagation()
+      close()
+    } else if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && !IS_TOUCH) {
+      event.preventDefault()
+      form.requestSubmit()
+    }
+  })
+  form.addEventListener('submit', (event) => {
+    event.preventDefault()
+    const text = area.value.trim()
+    if (!text && !message.attachments?.length) return area.focus()
+    if (text === message.content.trim()) return close()
+    if (state.stream) return toast('Wait for the reply to finish first.')
+    runTurn({ text, files: message.attachments ?? [], edit: message })
+  })
 }
 
 function typingDots() {
@@ -786,10 +1073,13 @@ function highlight(text, query) {
 
 function updateComposer() {
   const streamingHere = Boolean(state.stream) && state.stream.messages === state.messages
-  ui.send.setAttribute('aria-label', streamingHere ? 'Stop' : 'Send')
-  ui.send.title = streamingHere ? 'Stop' : 'Send'
+  const busy = state.composerFiles.some(isBusy)
+  const ready = state.composerFiles.some((item) => item.status === 'ready')
+  const label = streamingHere ? 'Stop' : busy ? 'Waiting for your files to upload' : 'Send'
+  ui.send.setAttribute('aria-label', label)
+  ui.send.title = label
   ui.send.querySelector('use').setAttribute('href', streamingHere ? '#i-stop' : '#i-up')
-  ui.send.disabled = !streamingHere && !ui.input.value.trim()
+  ui.send.disabled = !streamingHere && (busy || (!ui.input.value.trim() && !ready))
 }
 
 function updateInstructionsChip() {
@@ -797,13 +1087,370 @@ function updateInstructionsChip() {
   ui.instructionsBtn.classList.toggle('is-set', Boolean(value?.trim()))
 }
 
+// ── Files: attaching, showing, downloading ──────────────────────────────────
+
+/** What a sent message keeps about an attached file. */
+function sentFile(item) {
+  const { id, name, mime, size, kind, storage_path, image_paths, meta, preview } = item
+  return { id, name, mime, size, kind, storage_path, image_paths, meta, preview }
+}
+
+function addFiles(list) {
+  const files = [...(list ?? [])]
+  if (!files.length) return
+  if (!state.v3) return toast(UPGRADE_V3)
+  const room = MAX_FILES - state.composerFiles.length
+  if (room <= 0) return toast(`You can attach up to ${MAX_FILES} files per message.`)
+  if (files.length > room) toast(`Only ${room} more ${room === 1 ? 'file fits' : 'files fit'} in this message (up to ${MAX_FILES}), so the rest were left out.`)
+  for (const file of files.slice(0, room)) {
+    const item = {
+      key: crypto.randomUUID(),
+      name: file.name || 'file',
+      size: file.size,
+      mime: file.type,
+      kind: /^image\/(png|jpe?g|gif|webp|avif|bmp)$/.test(file.type) ? 'image' : null,
+      status: 'reading',
+      preview: /^image\//.test(file.type) ? URL.createObjectURL(file) : null,
+      paths: [],
+    }
+    state.composerFiles.push(item)
+    uploadFile(item, file)
+  }
+  renderComposerFiles()
+}
+
+/** Reads the file here, stores it in your Storage folder, and saves what was read. */
+async function uploadFile(item, file) {
+  try {
+    const result = await withTimeout(readAttachment(file), 120_000, `Reading “${item.name}” took too long. Try a smaller file.`)
+    if (item.removed) return
+    Object.assign(item, { kind: result.kind, mime: result.mime, meta: result.meta, status: 'uploading' })
+    if (result.kind === 'image' && result.images[0] && !item.preview) item.preview = URL.createObjectURL(result.images[0].blob)
+    renderComposerFiles()
+
+    const folder = `${state.user.id}/${crypto.randomUUID()}`
+    const uploads = []
+    const imagePaths = result.images.map((image, i) =>
+      `${folder}/${result.kind === 'image' ? '' : `view-${i + 1}-`}${storageName(image.name)}`
+    )
+    result.images.forEach((image, i) => uploads.push([imagePaths[i], image.blob, image.blob.type || 'image/jpeg']))
+    let storagePath = result.kind === 'image' ? imagePaths[0] : null
+    if (result.original) {
+      storagePath = `${folder}/${storageName(result.name)}`
+      uploads.push([storagePath, result.original, result.mime])
+    }
+    item.paths = uploads.map(([path]) => path)
+    for (const [path, blob, contentType] of uploads) {
+      const { error } = await supabase.storage.from(BUCKET).upload(path, blob, { contentType, upsert: false })
+      if (error) throw new Error(storageHint(error))
+      if (item.removed) return removeStored(item.paths)
+    }
+    const { data, error } = await supabase.from('chat_attachments').insert({
+      name: result.name.slice(0, 255),
+      mime: (result.mime || 'application/octet-stream').slice(0, 200),
+      size: result.size,
+      kind: result.kind,
+      storage_path: storagePath,
+      image_paths: imagePaths,
+      text_content: result.text,
+      meta: result.meta,
+    }).select('id').single()
+    if (error) throw new Error(dbHint(error))
+    Object.assign(item, { id: data.id, storage_path: storagePath, image_paths: imagePaths, status: 'ready' })
+    if (item.removed) return discardFile(item)
+  } catch (err) {
+    if (item.removed) return
+    console.warn('Could not attach', item.name, err)
+    item.status = 'error'
+    item.error = err?.message || "This file couldn't be attached."
+    removeStored(item.paths)
+  }
+  renderComposerFiles()
+}
+
+function withTimeout(promise, ms, message) {
+  let timer
+  const timeout = new Promise((_, reject) => (timer = setTimeout(() => reject(new Error(message)), ms)))
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
+}
+
+function removeComposerFile(item) {
+  item.removed = true
+  state.composerFiles = state.composerFiles.filter((f) => f !== item)
+  if (item.preview) URL.revokeObjectURL(item.preview)
+  if (item.status === 'ready') discardFile(item)
+  renderComposerFiles()
+  focusInput()
+}
+
+async function discardFile(item) {
+  if (item.id) await supabase.from('chat_attachments').delete().eq('id', item.id)
+  await removeStored(item.paths)
+}
+
+async function removeStored(paths) {
+  const unique = [...new Set((paths ?? []).filter(Boolean))]
+  for (let i = 0; i < unique.length; i += 100) {
+    const { error } = await supabase.storage.from(BUCKET).remove(unique.slice(i, i + 100))
+    if (error) console.warn('Could not delete stored files', error)
+  }
+}
+
+/** Storage paths of every file in the chats matching `filter` (e.g. one chat). */
+async function storedPaths(filter) {
+  if (!state.v3) return []
+  try {
+    const rows = await fetchAll(() => filter(supabase.from('chat_attachments').select('conversation_id, storage_path, image_paths')))
+    return rows.filter((r) => r.conversation_id).flatMap((r) => [r.storage_path, ...(r.image_paths ?? [])])
+  } catch {
+    return []
+  }
+}
+
+/** Files attached to a message that was never sent (tab closed, removed…) are deleted after a day. */
+async function cleanUpUnsentFiles() {
+  const { data } = await supabase.from('chat_attachments').select('id, storage_path, image_paths')
+    .is('message_id', null).lt('created_at', new Date(Date.now() - 86_400_000).toISOString()).limit(100)
+  if (!data?.length) return
+  await removeStored(data.flatMap((r) => [r.storage_path, ...(r.image_paths ?? [])]))
+  await supabase.from('chat_attachments').delete().in('id', data.map((r) => r.id))
+}
+
+function storageHint(error) {
+  const message = error?.message ?? String(error)
+  if (/bucket not found/i.test(message)) return 'Run supabase/upgrade-v3.sql in the SQL Editor first.'
+  if (/exceeded the maximum|too large|413/i.test(message)) return 'The file is larger than your Storage limit allows.'
+  if (/row-level security|unauthorized|403/i.test(message)) return "Storage didn't allow the upload. Re-run supabase/upgrade-v3.sql."
+  return message
+}
+
+function renderComposerFiles() {
+  ui.composerFiles.hidden = state.composerFiles.length === 0
+  ui.composerFiles.replaceChildren(...state.composerFiles.map((item) => {
+    const thumb = item.kind === 'image' && item.preview
+    const wrap = el('div', `pending-file is-${item.status}${thumb ? ' is-thumb' : ''}`)
+    const tile = thumb ? imageThumb(item) : fileCard(item, { status: item })
+    if (item.status === 'error') wrap.title = item.error
+    const remove = iconButton('i-x', `Remove ${item.name}`)
+    remove.classList.add('pending-remove')
+    remove.addEventListener('click', () => removeComposerFile(item))
+    wrap.append(tile, remove)
+    if (isBusy(item)) wrap.append(el('span', 'spinner'))
+    return wrap
+  }))
+  updateComposer()
+}
+
+/** Files shown above a message you sent. */
+function messageFiles(files) {
+  const box = el('div', 'msg-files')
+  const images = files.filter((f) => f.kind === 'image')
+  const others = files.filter((f) => f.kind !== 'image')
+  if (images.length) {
+    const row = el('div', `msg-thumbs${images.length === 1 ? ' single' : ''}`)
+    for (const file of images) {
+      const node = imageThumb(file)
+      node.addEventListener('click', () => openLightbox(file))
+      row.append(node)
+    }
+    box.append(row)
+  }
+  if (others.length) {
+    const row = el('div', 'msg-cards')
+    for (const file of others) {
+      const node = fileCard(file)
+      node.addEventListener('click', () => downloadFile(file))
+      row.append(node)
+    }
+    box.append(row)
+  }
+  return box
+}
+
+function imageThumb(file) {
+  const node = el(file.id && !file.status ? 'button' : 'span', 'file-thumb')
+  if (node.tagName === 'BUTTON') {
+    node.type = 'button'
+    node.setAttribute('aria-label', `Open ${file.name}`)
+  }
+  node.title = file.name
+  const img = el('img')
+  img.alt = file.name
+  img.decoding = 'async'
+  if (file.preview) img.src = file.preview
+  else {
+    const path = file.image_paths?.[0] ?? file.storage_path
+    if (path) {
+      signPath(path).then((url) => {
+        if (url) img.src = url
+        else node.classList.add('is-broken')
+      })
+    }
+  }
+  img.addEventListener('error', () => node.classList.add('is-broken'))
+  node.append(img)
+  return node
+}
+
+const FILE_TONES = [
+  ['pdf', /^pdf$/],
+  ['doc', /^(docx?|docm|dotx|odt|ott|rtf|pages|txt|md|markdown|epub)$/],
+  ['sheet', /^(xlsx?|xlsm|xltx|ods|csv|tsv|numbers)$/],
+  ['slides', /^(pptx?|pptm|ppsx|odp|key)$/],
+  ['archive', /^(zip|rar|7z|tar|gz|tgz|bz2|xz)$/],
+  ['video', /^(mp4|m4v|mov|webm|mkv|avi|ogv|3gp|mpe?g|wmv)$/],
+  ['audio', /^(mp3|wav|m4a|aac|ogg|oga|flac|opus|wma|aiff?)$/],
+  ['code', /^(js|mjs|cjs|jsx|ts|tsx|py|ipynb|java|kt|c|h|cc|cpp|hpp|cs|go|rs|rb|php|swift|dart|lua|r|sql|sh|bash|ps1|html?|css|scss|vue|svelte|json|ya?ml|toml|xml|svg|ini|env|dockerfile|gradle)$/],
+]
+
+function fileCard(file, { status } = {}) {
+  const ext = extOf(file.name)
+  const clickable = !status && file.id
+  const card = el(clickable ? 'button' : 'span', 'file-card')
+  if (clickable) card.type = 'button'
+  const tone = FILE_TONES.find(([, re]) => re.test(ext))?.[0] ?? 'other'
+  const badge = el('span', `file-badge tone-${tone}`, (ext || 'file').slice(0, 4).toUpperCase())
+  let sub
+  if (status?.status === 'reading') sub = 'Reading…'
+  else if (status?.status === 'uploading') sub = 'Uploading…'
+  else if (status?.status === 'error') sub = status.error
+  else {
+    const label = file.kind ? typeLabel(file) : (ext || 'file').toUpperCase()
+    sub = file.kind === 'file' ? `${label} · name only` : `${label} · ${formatSize(file.size)}`
+  }
+  const text = el('span', 'file-text')
+  text.append(el('span', 'file-name', file.name), el('span', 'file-sub', sub))
+  card.append(badge, text)
+  if (file.kind === 'file') card.classList.add('is-unreadable')
+  const note = typeof file.meta?.note === 'string' ? file.meta.note : ''
+  card.title = status?.status === 'error'
+    ? status.error
+    : [file.name, note, clickable ? 'Click to download.' : ''].filter(Boolean).join('\n')
+  if (clickable) card.setAttribute('aria-label', `Download ${file.name}`)
+  return card
+}
+
+// Private files are shown through short-lived signed links, fetched in batches.
+const signedUrls = new Map() // path → { url, until }
+let signBatch = null
+
+function signPath(path) {
+  const hit = signedUrls.get(path)
+  if (hit && hit.until > Date.now()) return Promise.resolve(hit.url)
+  if (!signBatch) {
+    signBatch = new Map()
+    setTimeout(flushSigns, 0)
+  }
+  if (!signBatch.has(path)) {
+    let resolve
+    const promise = new Promise((r) => (resolve = r))
+    signBatch.set(path, { promise, resolve })
+  }
+  return signBatch.get(path).promise
+}
+
+async function flushSigns() {
+  const batch = signBatch
+  signBatch = null
+  const paths = [...batch.keys()]
+  const { data, error } = await supabase.storage.from(BUCKET).createSignedUrls(paths, 3600)
+  for (const path of paths) {
+    const row = data?.find((r) => r.path === path)
+    const url = !error && row?.signedUrl && !row.error ? row.signedUrl : null
+    if (url) signedUrls.set(path, { url, until: Date.now() + 50 * 60_000 })
+    batch.get(path).resolve(url)
+  }
+}
+
+async function downloadFile(file) {
+  if (!file.storage_path) {
+    return toast(file.meta?.notStored
+      ? 'Only the text of this file was kept: the file itself was over 25 MB, too large to store.'
+      : "This file isn't stored, so it can't be downloaded.")
+  }
+  const { data, error } = await supabase.storage.from(BUCKET).createSignedUrl(file.storage_path, 60, { download: file.name })
+  if (error) return toast(`Couldn't download “${file.name}”. ${storageHint(error)}`)
+  const link = Object.assign(document.createElement('a'), { href: data.signedUrl, rel: 'noopener' })
+  document.body.append(link)
+  link.click()
+  link.remove()
+}
+
+function openLightbox(file) {
+  const path = file.image_paths?.[0] ?? file.storage_path
+  ui.lightboxName.textContent = file.name
+  ui.lightboxImg.alt = file.name
+  ui.lightboxImg.removeAttribute('src')
+  if (file.preview) ui.lightboxImg.src = file.preview
+  else if (path) signPath(path).then((url) => url && (ui.lightboxImg.src = url))
+  ui.lightboxDownload.onclick = () => downloadFile(file)
+  ui.lightboxDownload.hidden = !file.storage_path
+  ui.lightbox.showModal()
+}
+
+ui.lightboxClose.addEventListener('click', () => ui.lightbox.close())
+ui.lightbox.addEventListener('click', (event) => {
+  if (event.target === ui.lightbox || event.target.classList.contains('lightbox-stage')) ui.lightbox.close()
+})
+
+ui.attachBtn.addEventListener('click', () => {
+  if (!state.v3) return toast(UPGRADE_V3)
+  ui.fileInput.click()
+})
+ui.fileInput.addEventListener('change', () => {
+  addFiles(ui.fileInput.files)
+  ui.fileInput.value = ''
+})
+
+// Pasting a screenshot or a copied file attaches it. (Text copied from Word or a
+// web page also carries a picture of itself; that pastes as text, as expected.)
+ui.input.addEventListener('paste', (event) => {
+  const data = event.clipboardData
+  if (!data?.files?.length) return
+  if (data.types.includes('text/plain') && data.getData('text/plain').trim()) return
+  event.preventDefault()
+  addFiles(data.files)
+})
+
+// Drag & drop anywhere on the chat
+const dragHasFiles = (event) => [...(event.dataTransfer?.types ?? [])].includes('Files')
+let dragDepth = 0
+ui.main.addEventListener('dragenter', (event) => {
+  if (!dragHasFiles(event) || !state.user) return
+  event.preventDefault()
+  dragDepth++
+  ui.main.classList.add('is-dragging')
+})
+ui.main.addEventListener('dragover', (event) => {
+  if (!dragHasFiles(event)) return
+  event.preventDefault()
+  event.dataTransfer.dropEffect = 'copy'
+})
+ui.main.addEventListener('dragleave', (event) => {
+  if (!dragHasFiles(event)) return
+  dragDepth = Math.max(0, dragDepth - 1)
+  if (!dragDepth) ui.main.classList.remove('is-dragging')
+})
+ui.main.addEventListener('drop', (event) => {
+  if (!dragHasFiles(event)) return
+  event.preventDefault()
+  dragDepth = 0
+  ui.main.classList.remove('is-dragging')
+  addFiles(event.dataTransfer.files)
+})
+// A file dropped next to the chat shouldn't make the browser leave the app to open it.
+window.addEventListener('dragover', (event) => dragHasFiles(event) && event.preventDefault())
+window.addEventListener('drop', (event) => dragHasFiles(event) && event.preventDefault())
+
 // ── Chat actions ─────────────────────────────────────────────────────────────
 
 async function deleteChat(conversation) {
   if (!confirm(`Delete "${conversation.title}"? This can't be undone.`)) return
   if (state.stream?.conversationId === conversation.id) state.stream.controller.abort()
+  const files = await storedPaths((q) => q.eq('conversation_id', conversation.id))
   const { error } = await supabase.from('chat_conversations').delete().eq('id', conversation.id)
   if (error) return toast(`Couldn't delete the chat. ${dbHint(error)}`)
+  removeStored(files)
   state.conversations = state.conversations.filter((c) => c.id !== conversation.id)
   renderSidebar()
   if (state.current?.id === conversation.id) goToNewChat()
@@ -1268,17 +1915,31 @@ ui.signOut.addEventListener('click', async () => {
 ui.exportData.addEventListener('click', async () => {
   ui.exportData.disabled = true
   try {
-    const [conversations, messages] = await Promise.all([
+    const [conversations, messages, files] = await Promise.all([
       fetchAll(() =>
         supabase.from('chat_conversations').select('id, title, model, system_prompt, created_at, updated_at')
           .order('created_at', { ascending: true })
       ),
       fetchAll(() =>
         supabase.from('chat_messages')
-          .select('conversation_id, role, content, model, finish_reason, prompt_tokens, completion_tokens, created_at')
+          .select(`id, conversation_id, role, content, model, finish_reason, prompt_tokens, completion_tokens, created_at${
+            state.v3 ? ', parent_id' : ''
+          }`)
           .order('created_at', { ascending: true })
       ),
+      state.v3
+        ? fetchAll(() =>
+          supabase.from('chat_attachments').select('message_id, name, mime, size, kind').not('message_id', 'is', null)
+            .order('created_at', { ascending: true })
+        )
+        : [],
     ])
+    const filesOf = new Map()
+    for (const { message_id: id, ...file } of files) {
+      if (!filesOf.has(id)) filesOf.set(id, [])
+      filesOf.get(id).push(file)
+    }
+    for (const message of messages) if (filesOf.has(message.id)) message.attachments = filesOf.get(message.id)
     const memories = state.v2
       ? (await supabase.from('chat_memories').select('content, created_at').order('created_at', { ascending: true })).data ?? []
       : []
@@ -1304,8 +1965,10 @@ ui.exportData.addEventListener('click', async () => {
 ui.deleteAll.addEventListener('click', async () => {
   if (!confirm("Delete all chats and their messages? This can't be undone.")) return
   state.stream?.controller.abort()
+  const files = await storedPaths((q) => q)
   const { error } = await supabase.from('chat_conversations').delete().eq('user_id', state.user.id)
   if (error) return toast(`Couldn't delete your chats. ${dbHint(error)}`)
+  removeStored(files)
   state.conversations = []
   ui.settingsDialog.close()
   renderSidebar()
