@@ -2,7 +2,7 @@
 // Fill these in from Supabase Dashboard → Project Settings → API Keys.
 // Both values are safe to publish: your data is protected by Row Level
 // Security and your model API key lives only in the Edge Function secrets.
-// ─────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────`───────────────────────────────
 
 export const SUPABASE_URL = 'https://vrmdgbspgizhgzvlnmjq.supabase.co'
 export const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_9BOfFizIFRBz-rGiP1nVMg_WNbxPU5X' // or the legacy "anon" key
