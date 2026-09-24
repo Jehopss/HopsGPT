@@ -8,6 +8,10 @@
   <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#171716" media="(prefers-color-scheme: dark)">
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23191918'/%3E%3Cpath d='M10 12.5h12M10 17.5h8' stroke='%23fff' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+  <script>
+    // Apply the saved theme before the page paints (no flash of the wrong colours).
+    try { var t = localStorage.getItem('chat.theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t } catch (e) {}
+  </script>
   <link rel="stylesheet" href="style.css">
   <script type="module" src="app.js"></script>
 </head>
@@ -24,6 +28,20 @@
       <symbol id="i-lines" viewBox="0 0 24 24"><path d="M5 7h14M5 12h14M5 17h8"/></symbol>
       <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 8h9M17 8h3M4 16h3M11 16h9"/><circle cx="15" cy="8" r="2"/><circle cx="9" cy="16" r="2"/></symbol>
       <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m8 10 4 4 4-4"/></symbol>
+      <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m10 7 5 5-5 5"/></symbol>
+      <symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="m14 7-5 5 5 5"/></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+      <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></symbol>
+      <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7.5 10.5 12 15l4.5-4.5M5 19h14"/></symbol>
+      <symbol id="i-code" viewBox="0 0 24 24"><path d="m8.5 8-4 4 4 4M15.5 8l4 4-4 4M13.5 5l-3 14"/></symbol>
+      <symbol id="i-image" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><circle cx="9.5" cy="9.5" r="1.6"/><path d="m20 15-4.5-4.5L6 20"/></symbol>
+      <symbol id="i-file" viewBox="0 0 24 24"><path d="M13.5 3.5H7A2 2 0 0 0 5 5.5v13a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9Z"/><path d="M13.5 3.5V9H19M8.5 13h7M8.5 16.5h5"/></symbol>
+      <symbol id="i-edit" viewBox="0 0 24 24"><path d="M15.6 4.4a1.9 1.9 0 0 1 2.7 2.7L8 17.4l-3.6.9.9-3.6Z"/><path d="M13.5 6.5l2.7 2.7"/></symbol>
+      <symbol id="i-chart" viewBox="0 0 24 24"><path d="M5 19V11M10 19V6M15 19v-5M20 19V9"/></symbol>
+      <symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3.5 13.8 9a2 2 0 0 0 1.3 1.3L20.5 12l-5.4 1.8a2 2 0 0 0-1.3 1.3L12 20.5l-1.8-5.4a2 2 0 0 0-1.3-1.3L3.5 12l5.4-1.8A2 2 0 0 0 10.2 9Z"/></symbol>
+      <symbol id="i-memory" viewBox="0 0 24 24"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3L4.5 9"/><path d="M4.5 4.5V9H9M12 8v4.2l2.8 1.8"/></symbol>
+      <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8.5" r="3.5"/><path d="M5 19.5a7 7 0 0 1 14 0"/></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3L19.5 9"/><path d="M19.5 4.5V9H15"/></symbol>
     </defs>
   </svg>
 
@@ -73,6 +91,11 @@
         <div class="brand-row"><span class="brand-dot" aria-hidden="true"></span><span class="brand-name" data-app-name>Chat</span></div>
         <button id="new-chat" class="icon-btn" type="button" title="New chat" aria-label="New chat"><svg class="icon"><use href="#i-new"/></svg></button>
       </div>
+      <label class="sidebar-search">
+        <svg class="icon" aria-hidden="true"><use href="#i-search"/></svg>
+        <span class="sr-only">Search chats</span>
+        <input id="chat-search" type="search" placeholder="Search chats" autocomplete="off" spellcheck="false">
+      </label>
       <nav id="chat-list" class="chat-list"></nav>
       <button id="account-btn" class="account" type="button" aria-label="Settings">
         <span id="avatar" class="avatar" aria-hidden="true"></span>
@@ -119,6 +142,33 @@
         <p class="composer-note">Enter to send · Shift + Enter for a new line</p>
       </form>
     </main>
+
+    <!-- Artifact panel: preview / code of what the model built -->
+    <aside id="artifact-panel" class="artifact-panel" aria-label="Artifact" hidden>
+      <header class="ap-head">
+        <div class="ap-heading">
+          <div id="ap-title" class="ap-title"></div>
+          <div id="ap-meta" class="ap-meta"></div>
+        </div>
+        <div id="ap-versions" class="ap-versions">
+          <button id="ap-prev" class="icon-btn sm" type="button" aria-label="Previous version"><svg class="icon"><use href="#i-chevron-left"/></svg></button>
+          <span id="ap-version" class="ap-version"></span>
+          <button id="ap-next" class="icon-btn sm" type="button" aria-label="Next version"><svg class="icon"><use href="#i-chevron-right"/></svg></button>
+        </div>
+        <button id="ap-close" class="icon-btn sm" type="button" aria-label="Close panel" title="Close"><svg class="icon"><use href="#i-x"/></svg></button>
+      </header>
+      <div class="ap-toolbar">
+        <div class="ap-tabs" role="tablist" aria-label="View">
+          <button id="ap-tab-preview" type="button" role="tab" aria-selected="true">Preview</button>
+          <button id="ap-tab-code" type="button" role="tab" aria-selected="false">Code</button>
+        </div>
+        <div class="ap-tools">
+          <button id="ap-copy" class="icon-btn sm" type="button" aria-label="Copy" title="Copy"><svg class="icon"><use href="#i-copy"/></svg></button>
+          <button id="ap-download" class="icon-btn sm" type="button" aria-label="Download" title="Download"><svg class="icon"><use href="#i-download"/></svg></button>
+        </div>
+      </div>
+      <div id="ap-body" class="ap-body"></div>
+    </aside>
   </div>
 
   <dialog id="instructions-dialog" class="dialog">
@@ -133,23 +183,172 @@
     </form>
   </dialog>
 
-  <dialog id="settings-dialog" class="dialog">
-    <form method="dialog">
-      <h3>Settings</h3>
-      <label class="field">
-        <span>Custom instructions</span>
-        <small class="muted">Used in every chat. Tell the model about yourself and how you like answers.</small>
-        <textarea id="custom-instructions" rows="7" maxlength="20000" placeholder="e.g. I'm a designer. Keep answers short and practical, with examples."></textarea>
-      </label>
-      <div class="account-row">
-        <div><small class="muted">Signed in as</small><div id="settings-email" class="account-row-email"></div></div>
-        <button id="sign-out" class="btn subtle" type="button">Sign out</button>
+  <dialog id="settings-dialog" class="dialog settings" aria-label="Settings">
+    <div class="settings-layout">
+      <nav class="settings-nav" aria-label="Settings sections">
+        <div class="settings-nav-title">Settings</div>
+        <button type="button" class="settings-tab" data-pane="general"><svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg><span>General</span></button>
+        <button type="button" class="settings-tab" data-pane="usage"><svg class="icon" aria-hidden="true"><use href="#i-chart"/></svg><span>Usage</span></button>
+        <button type="button" class="settings-tab" data-pane="capabilities"><svg class="icon" aria-hidden="true"><use href="#i-spark"/></svg><span>Capabilities</span></button>
+        <button type="button" class="settings-tab" data-pane="memory"><svg class="icon" aria-hidden="true"><use href="#i-memory"/></svg><span>Memory</span></button>
+        <button type="button" class="settings-tab" data-pane="account"><svg class="icon" aria-hidden="true"><use href="#i-user"/></svg><span>Account</span></button>
+      </nav>
+
+      <div class="settings-main">
+        <button id="settings-close" class="icon-btn settings-close" type="button" aria-label="Close settings"><svg class="icon"><use href="#i-x"/></svg></button>
+        <p id="settings-upgrade" class="settings-banner" hidden>
+          Usage, Memory and chat search need a database update. Run <code>supabase/upgrade-v2.sql</code> in the Supabase SQL Editor, then reload this page.
+        </p>
+
+        <!-- General -->
+        <section class="settings-pane" data-pane="general">
+          <h2>General</h2>
+          <div class="set-row">
+            <div class="set-text">
+              <div class="set-label">Theme</div>
+              <div class="set-desc">Changes how the app looks on this device only.</div>
+            </div>
+            <div id="theme-control" class="segmented" role="radiogroup" aria-label="Theme">
+              <button type="button" role="radio" data-theme-value="system">System</button>
+              <button type="button" role="radio" data-theme-value="light">Light</button>
+              <button type="button" role="radio" data-theme-value="dark">Dark</button>
+            </div>
+          </div>
+
+          <h3 class="set-group">Notifications</h3>
+          <div class="set-row">
+            <div class="set-text">
+              <div class="set-label">Reply finished</div>
+              <div class="set-desc">Get a browser notification when a reply finishes while this tab is in the background. Applies to this device only.</div>
+            </div>
+            <label class="switch"><input id="set-notify" type="checkbox" role="switch"><span class="switch-track" aria-hidden="true"></span><span class="sr-only">Reply finished notifications</span></label>
+          </div>
+
+          <h3 class="set-group">Instructions for every chat</h3>
+          <p class="set-desc">Tell the model about yourself and how you like answers. These apply to every chat, including ones you already started.</p>
+          <textarea id="custom-instructions" class="set-textarea" rows="6" maxlength="20000" placeholder="e.g. I'm a designer. Keep answers short and practical, with examples."></textarea>
+          <div class="set-actions"><button id="save-instructions" class="btn primary" type="button">Save instructions</button></div>
+        </section>
+
+        <!-- Usage -->
+        <section class="settings-pane" data-pane="usage" hidden>
+          <h2>Usage</h2>
+          <div class="usage-card">
+            <div class="usage-row">
+              <div class="set-text">
+                <div class="set-label">This month</div>
+                <div id="usage-reset" class="set-desc"></div>
+              </div>
+              <div class="usage-figure">
+                <div id="usage-month-cost" class="usage-cost">—</div>
+                <div id="usage-month-tokens" class="set-desc"></div>
+              </div>
+            </div>
+            <div id="usage-meter" class="meter" hidden><span id="usage-meter-fill"></span></div>
+            <div id="usage-meter-label" class="set-desc"></div>
+            <div id="usage-chart" class="usage-chart" aria-hidden="true"></div>
+          </div>
+          <div class="usage-card">
+            <div class="usage-row">
+              <div class="set-text"><div class="set-label">Today</div><div id="usage-today-replies" class="set-desc"></div></div>
+              <div class="usage-figure">
+                <div id="usage-today-cost" class="usage-cost">—</div>
+                <div id="usage-today-tokens" class="set-desc"></div>
+              </div>
+            </div>
+          </div>
+
+          <h3 class="set-group">By model this month</h3>
+          <div class="table-wrap">
+            <table class="usage-table">
+              <thead><tr><th>Model</th><th>Replies</th><th>Tokens</th><th>Est. cost</th></tr></thead>
+              <tbody id="usage-models"></tbody>
+            </table>
+          </div>
+
+          <h3 class="set-group">Monthly budget</h3>
+          <div class="set-row">
+            <div class="set-text">
+              <div class="set-label">Budget</div>
+              <div class="set-desc">Shows how much of your budget this month's usage has spent. Going over only turns the bar red; chats keep working.</div>
+            </div>
+            <label class="money-input"><span>Rp</span><input id="set-budget" type="number" min="0" step="1000" inputmode="numeric" placeholder="None" aria-label="Monthly budget in rupiah"></label>
+          </div>
+          <p class="set-footnote">Costs are estimates from the prices in <code>config.js</code>. A <b>≈</b> means the provider didn't report tokens for some replies, so they were estimated from text length.</p>
+          <p class="set-footnote">Last updated: <span id="usage-updated">—</span>
+            <button id="usage-refresh" class="icon-btn sm inline" type="button" aria-label="Refresh usage" title="Refresh"><svg class="icon"><use href="#i-refresh"/></svg></button>
+          </p>
+        </section>
+
+        <!-- Capabilities -->
+        <section class="settings-pane" data-pane="capabilities" hidden>
+          <h2>Capabilities</h2>
+          <div class="set-row">
+            <div class="set-text">
+              <div class="set-label">Artifacts</div>
+              <div class="set-desc">Lets the model build web pages, small apps, SVG graphics and long documents in a panel next to the chat, where you can preview, copy and download them. When off, it writes code as plain text in the reply instead.</div>
+            </div>
+            <label class="switch"><input id="set-artifacts" type="checkbox" role="switch" data-v2><span class="switch-track" aria-hidden="true"></span><span class="sr-only">Artifacts</span></label>
+          </div>
+        </section>
+
+        <!-- Memory -->
+        <section class="settings-pane" data-pane="memory" hidden>
+          <h2>Memory</h2>
+          <div class="set-row">
+            <div class="set-text">
+              <div class="set-label">Search and reference chats</div>
+              <div class="set-desc">Lets the model look up relevant parts of your past chats when you mention them. Matching excerpts are added to the model's context, which uses a few more tokens per message.</div>
+            </div>
+            <label class="switch"><input id="set-reference" type="checkbox" role="switch" data-v2><span class="switch-track" aria-hidden="true"></span><span class="sr-only">Search and reference chats</span></label>
+          </div>
+          <div class="set-row">
+            <div class="set-text">
+              <div class="set-label">Generate memory from chats</div>
+              <div class="set-desc">After each reply, the model saves lasting facts you share about yourself and uses them in every chat. This adds one short model call per reply. Turning it off stops both saving and using memory; saved memories stay until you delete them.</div>
+            </div>
+            <label class="switch"><input id="set-memory" type="checkbox" role="switch" data-v2><span class="switch-track" aria-hidden="true"></span><span class="sr-only">Generate memory from chats</span></label>
+          </div>
+
+          <div class="memory-head">
+            <h3 class="set-group">What the model remembers</h3>
+            <span id="memory-count" class="set-desc"></span>
+          </div>
+          <ul id="memory-list" class="memory-list"></ul>
+          <form id="memory-form" class="memory-form">
+            <input id="memory-instruction" type="text" maxlength="2000" placeholder="Tell it what to add, change or remove" autocomplete="off" aria-label="Tell the model what to add, change or remove in memory" data-v2>
+            <button id="memory-submit" class="send-btn" type="submit" aria-label="Update memory" disabled data-v2><svg class="icon"><use href="#i-up"/></svg></button>
+          </form>
+          <button id="memory-clear" class="link-btn danger" type="button" data-v2>Delete all memories</button>
+        </section>
+
+        <!-- Account -->
+        <section class="settings-pane" data-pane="account" hidden>
+          <h2>Account</h2>
+          <div class="set-row">
+            <div class="set-text">
+              <div class="set-label">Signed in as</div>
+              <div id="settings-email" class="set-desc"></div>
+            </div>
+            <button id="sign-out" class="btn" type="button">Sign out</button>
+          </div>
+          <div class="set-row">
+            <div class="set-text">
+              <div class="set-label">Export data</div>
+              <div class="set-desc">Downloads all your chats, memories and settings as one JSON file. Nothing is deleted.</div>
+            </div>
+            <button id="export-data" class="btn" type="button">Export</button>
+          </div>
+          <div class="set-row">
+            <div class="set-text">
+              <div class="set-label">Delete all chats</div>
+              <div class="set-desc">Permanently deletes every chat and its messages from Supabase. This can't be undone. Memories and settings stay.</div>
+            </div>
+            <button id="delete-all" class="btn danger" type="button">Delete all</button>
+          </div>
+        </section>
       </div>
-      <div class="dialog-actions">
-        <button class="btn" value="cancel" formnovalidate>Cancel</button>
-        <button class="btn primary" value="save">Save</button>
-      </div>
-    </form>
+    </div>
   </dialog>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>

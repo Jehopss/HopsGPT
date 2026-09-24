@@ -1,9 +1,10 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Minimal Chat — Edge Function "chat"
 //
-// Streams a reply from any OpenAI-compatible API (OpenRouter by default, so one
-// key reaches Claude, GPT, Gemini, DeepSeek, …) and stores the whole chat in
-// Supabase. The model sees the chat history + your instructions as context.
+// Streams a reply from any OpenAI-compatible API (OpenRouter, GutsAI, OpenAI, …)
+// and stores the whole chat in Supabase. The model gets as context: the chat
+// history, your instructions, what it remembers about you (memory), excerpts
+// from past chats (optional) and how to make artifacts.
 //
 // Secrets (Dashboard → Edge Functions → Secrets):
 //   LLM_API_KEY           required  your provider API key
@@ -11,6 +12,7 @@
 //   ALLOWED_EMAILS        optional  comma-separated emails allowed to chat (recommended)
 //   ALLOWED_MODELS        optional  comma-separated model ids; empty = any model
 //   DEFAULT_MODEL         optional  used when the browser sends no model
+//   MEMORY_MODEL          optional  model that updates memory (default: the chat's model)
 //   SYSTEM_PROMPT         optional  base system prompt; {date} becomes today's date
 //   CONTEXT_MAX_MESSAGES  optional  how many recent messages the model sees (default 40)
 //   CONTEXT_MAX_CHARS     optional  character budget for that history (default 60000)
@@ -33,6 +35,7 @@ const LLM_BASE_URL = (env('LLM_BASE_URL') || 'https://openrouter.ai/api/v1').rep
 const ALLOWED_EMAILS = list(env('ALLOWED_EMAILS')).map((e) => e.toLowerCase())
 const ALLOWED_MODELS = list(env('ALLOWED_MODELS'))
 const DEFAULT_MODEL = env('DEFAULT_MODEL') || ALLOWED_MODELS[0] || 'anthropic/claude-sonnet-5'
+const MEMORY_MODEL = env('MEMORY_MODEL')
 const SYSTEM_PROMPT = env('SYSTEM_PROMPT') ||
   'You are a helpful assistant. Reply in the language the user writes in. ' +
     'Be clear and concise, and use Markdown (lists, tables, code blocks) when it helps.\n' +
@@ -43,11 +46,41 @@ const MAX_OUTPUT_TOKENS = int(env('MAX_OUTPUT_TOKENS'), 0)
 
 const MAX_INPUT_CHARS = 100_000
 const MAX_INSTRUCTIONS_CHARS = 20_000
+const MAX_MEMORIES = 150
+const MEMORY_CONTEXT_CHARS = 8_000
 const CHECKPOINT_EVERY_MS = 2_000
 const HEARTBEAT_EVERY_MS = 15_000
 
 const IS_OPENROUTER = LLM_BASE_URL.includes('openrouter.ai')
 const IS_OPENAI = LLM_BASE_URL.includes('api.openai.com')
+
+const ARTIFACT_PROMPT =
+  `You can create artifacts: self-contained content shown in a side panel next to the chat, where the user can preview, copy and download it.
+Use an artifact for a complete web page, app, game or UI mockup (HTML), an SVG image, or a long document the user will reuse (Markdown, roughly 20+ lines). Don't use one for short code snippets, explanations or ordinary answers.
+Format:
+<artifact id="kebab-case-id" type="html|svg|markdown" title="Short title">
+full content
+</artifact>
+- HTML must be one complete document with inline CSS and JS. External scripts and styles may only come from https://cdn.jsdelivr.net or https://cdnjs.cloudflare.com.
+- To revise an artifact, reuse its id and write the full updated content, never a partial diff.
+- Don't put code fences inside or around the artifact tag. Keep the text outside the artifact short.`
+
+const MEMORY_SYSTEM =
+  `You maintain the long-term memory a chat assistant keeps about its user. Memories are short, durable facts the user shared about themselves: name, role, work, studies, ongoing projects, tools they use, and how they like answers.
+Rules:
+- Save only what the user said about themselves. Never save what the assistant said, one-off requests, or temporary details (today's task, a single question).
+- Never save passwords, API keys, ID or card numbers, health, religion, political views, sexual orientation, or financial details such as income or debts.
+- If the user explicitly asks to remember something, save it. If they ask to forget or change something, delete or update it.
+- Update an existing memory instead of adding a duplicate. Keep each memory to one short sentence, in the language the user used.
+- Most exchanges need no change at all.
+Reply with JSON only: {"add": ["..."], "update": [{"id": "<id>", "content": "..."}], "delete": ["<id>"]}. Use empty arrays when nothing changes.`
+
+const STOPWORDS = new Set(
+  ('the and for you are with this that what how can could would should about have has from your into then than there ' +
+    'they them was were will just like want need make please yang dan ini itu aja ada apa bisa dong sih nya untuk ' +
+    'dengan dari kalau kalo tapi juga udah sudah mau buat gimana kenapa saya aku kamu gue kita kami mereka jadi lagi ' +
+    'banget atau pake pakai kasih tolong bikin coba').split(' '),
+)
 
 // Supabase injects these. New projects have publishable/secret keys (JSON maps);
 // older ones have the legacy anon/service_role keys. Either works.
@@ -79,8 +112,8 @@ const JWKS = (() => {
 const NO_SESSION = { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false }
 // Reused across requests so the signing keys stay cached.
 const authClient = createClient(SUPABASE_URL, PUBLISHABLE_KEY, { auth: NO_SESSION })
-// Saves replies even if the user's token expires mid-stream. Bypasses RLS,
-// so it only ever writes rows for the already-verified user.
+// Saves replies and memories even if the user's token expires mid-stream.
+// Bypasses RLS, so every write through it names the already-verified user.
 const adminClient = SECRET_KEY ? createClient(SUPABASE_URL, SECRET_KEY, { auth: NO_SESSION }) : null
 
 const corsHeaders = {
@@ -94,11 +127,19 @@ const corsHeaders = {
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface ChatRequest {
+  action?: unknown
   conversation_id?: string | null
   message?: unknown
   model?: unknown
   system_prompt?: unknown
   timezone?: unknown
+  instruction?: unknown
+}
+
+interface Prefs {
+  artifacts?: boolean
+  memory?: boolean
+  referenceChats?: boolean
 }
 
 interface HistoryRow {
@@ -108,6 +149,11 @@ interface HistoryRow {
 
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
+  content: string
+}
+
+interface MemoryRow {
+  id: string
   content: string
 }
 
@@ -137,6 +183,7 @@ type StreamEvent =
   | { type: 'delta'; text: string }
   | { type: 'error'; message: string }
   | { type: 'done'; message_id: string | null; saved: boolean; finish_reason: string | null }
+  | { type: 'memory'; changes: number }
 
 class HttpError extends Error {
   constructor(public status: number, message: string) {
@@ -150,7 +197,7 @@ Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
   if (req.method !== 'POST') return json({ error: 'Method not allowed.' }, 405)
   try {
-    return await handleChat(req)
+    return await handleRequest(req)
   } catch (err) {
     if (err instanceof HttpError) return json({ error: err.message }, err.status)
     console.error('chat: unexpected error', err)
@@ -158,7 +205,7 @@ Deno.serve(async (req) => {
   }
 })
 
-async function handleChat(req: Request): Promise<Response> {
+async function handleRequest(req: Request): Promise<Response> {
   // 1. Who is calling? (the platform already checked the JWT; we verify again
   //    so the function stays safe even if JWT verification is switched off)
   const token = (req.headers.get('Authorization') ?? '').replace(/^Bearer\s+/i, '').trim()
@@ -175,31 +222,33 @@ async function handleChat(req: Request): Promise<Response> {
   }
   if (!LLM_API_KEY) throw new HttpError(500, 'LLM_API_KEY is not set. Add it under Edge Functions → Secrets.')
 
-  // 2. Validate the request
   let body: ChatRequest
   try {
     body = await req.json()
   } catch {
     throw new HttpError(400, 'Invalid JSON body.')
   }
-  const text = typeof body.message === 'string' ? clean(body.message).trim() : ''
-  if (!text) throw new HttpError(400, 'Message is empty.')
-  if (text.length > MAX_INPUT_CHARS) {
-    throw new HttpError(413, `Message is too long (max ${MAX_INPUT_CHARS.toLocaleString('en')} characters).`)
-  }
-  const model = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : DEFAULT_MODEL
-  if (!/^[\w.:/@~+-]{1,200}$/.test(model)) throw new HttpError(400, 'Invalid model id.')
-  if (ALLOWED_MODELS.length > 0 && !ALLOWED_MODELS.includes(model)) {
-    throw new HttpError(400, `Model "${model}" is not in ALLOWED_MODELS.`)
-  }
 
-  // 3. Database client that acts as the user (RLS applies)
+  // Database client that acts as the user (RLS applies)
   const db = createClient(SUPABASE_URL, PUBLISHABLE_KEY, {
     auth: NO_SESSION,
     global: { headers: { Authorization: `Bearer ${token}` } },
   })
 
-  // 4. Find the chat, or create it on the first message
+  if (body.action === 'memory_edit') return handleMemoryEdit(body, db, userId)
+  return handleChat(body, db, userId)
+}
+
+async function handleChat(body: ChatRequest, db: SupabaseClient, userId: string): Promise<Response> {
+  // 2. Validate the request
+  const text = typeof body.message === 'string' ? clean(body.message).trim() : ''
+  if (!text) throw new HttpError(400, 'Message is empty.')
+  if (text.length > MAX_INPUT_CHARS) {
+    throw new HttpError(413, `Message is too long (max ${MAX_INPUT_CHARS.toLocaleString('en')} characters).`)
+  }
+  const model = pickModel(body.model)
+
+  // 3. Find the chat, or create it on the first message
   let conversation: { id: string; title: string; system_prompt: string }
   const isNew = !body.conversation_id
   if (!isNew) {
@@ -223,7 +272,7 @@ async function handleChat(req: Request): Promise<Response> {
     conversation = data
   }
 
-  // 5. Save the user's message
+  // 4. Save the user's message
   const { data: userMessage, error: insertError } = await db
     .from('chat_messages')
     .insert({ conversation_id: conversation.id, user_id: userId, role: 'user', content: text })
@@ -231,25 +280,35 @@ async function handleChat(req: Request): Promise<Response> {
     .single()
   if (insertError) throw dbError(insertError)
 
-  // 6. Build the context: system prompt + your instructions + recent history
-  const [historyResult, settingsResult] = await Promise.all([
+  // 5. Build the context: instructions, memory, past chats, recent history
+  const [historyResult, settings, memories] = await Promise.all([
     db
       .from('chat_messages')
       .select('role, content')
       .eq('conversation_id', conversation.id)
       .order('created_at', { ascending: false })
       .limit(CONTEXT_MAX_MESSAGES),
-    db.from('chat_settings').select('custom_instructions').eq('user_id', userId).maybeSingle(),
+    loadSettings(db, userId),
+    loadMemories(db, userId),
   ])
   if (historyResult.error) throw dbError(historyResult.error)
   const history = fitHistory((historyResult.data as HistoryRow[]).reverse())
+  const memoryOn = settings.v2 && settings.prefs.memory !== false
+  const pastChats = settings.v2 && settings.prefs.referenceChats === true
+    ? await searchPastChats(db, text, conversation.id)
+    : ''
   const system = buildSystemPrompt({
-    customInstructions: settingsResult.data?.custom_instructions ?? '',
+    customInstructions: settings.customInstructions,
     chatInstructions: conversation.system_prompt,
     timezone: typeof body.timezone === 'string' ? body.timezone : '',
+    memories: memoryOn ? memories : [],
+    pastChats,
+    artifacts: settings.prefs.artifacts !== false,
   })
+  const messages: ChatMessage[] = [{ role: 'system', content: system }, ...history]
+  const saveWith = adminClient ?? db
 
-  // 7. Stream the reply back while saving it
+  // 6. Stream the reply back while saving it; then update memory
   return streamReply({
     userId,
     model,
@@ -262,12 +321,97 @@ async function handleChat(req: Request): Promise<Response> {
       user_message_id: userMessage.id,
       model,
     },
-    messages: [{ role: 'system', content: system }, ...history],
-    saveWith: adminClient ?? db,
+    messages,
+    saveWith,
+    afterReply: memoryOn && text.length >= 8
+      ? async (reply) => {
+        const result = await runMemoryUpdate({
+          client: saveWith,
+          userId,
+          model: MEMORY_MODEL || model,
+          memories,
+          maxAdds: 5,
+          task: `Latest exchange:\nUser: ${text.slice(0, 4000)}\nAssistant: ${stripArtifacts(reply).slice(0, 1500)}`,
+        })
+        return result.added + result.updated + result.deleted
+      }
+      : undefined,
   })
 }
 
+/** Settings → Memory → "Tell the assistant what to change", and memory import. */
+async function handleMemoryEdit(body: ChatRequest, db: SupabaseClient, userId: string): Promise<Response> {
+  const instruction = typeof body.instruction === 'string' ? clean(body.instruction).trim() : ''
+  if (!instruction) throw new HttpError(400, 'Tell me what to change.')
+  if (instruction.length > MAX_INSTRUCTIONS_CHARS) throw new HttpError(413, 'That text is too long.')
+  const memories = await loadMemories(db, userId)
+  const result = await runMemoryUpdate({
+    client: adminClient ?? db,
+    userId,
+    model: MEMORY_MODEL || pickModel(body.model),
+    memories,
+    maxAdds: 50,
+    task: `The user is editing their memories directly. Do exactly what they ask (add, update or delete), ` +
+      `even if it is only one fact. Their request:\n"""\n${instruction}\n"""`,
+  })
+  return json({ ...result, memories: await loadMemories(db, userId) })
+}
+
+function pickModel(value: unknown): string {
+  const model = typeof value === 'string' && value.trim() ? value.trim() : DEFAULT_MODEL
+  if (!/^[\w.:/@~+-]{1,200}$/.test(model)) throw new HttpError(400, 'Invalid model id.')
+  if (ALLOWED_MODELS.length > 0 && !ALLOWED_MODELS.includes(model)) {
+    throw new HttpError(400, `Model "${model}" is not in ALLOWED_MODELS.`)
+  }
+  return model
+}
+
 // ── Context ──────────────────────────────────────────────────────────────────
+
+/** Settings row. `v2` is false until supabase/upgrade-v2.sql has been run. */
+async function loadSettings(db: SupabaseClient, userId: string) {
+  const res = await db.from('chat_settings').select('custom_instructions, preferences').eq('user_id', userId)
+    .maybeSingle()
+  if (!res.error) {
+    return {
+      v2: true,
+      customInstructions: String(res.data?.custom_instructions ?? ''),
+      prefs: (res.data?.preferences ?? {}) as Prefs,
+    }
+  }
+  const old = await db.from('chat_settings').select('custom_instructions').eq('user_id', userId).maybeSingle()
+  return { v2: false, customInstructions: String(old.data?.custom_instructions ?? ''), prefs: {} as Prefs }
+}
+
+async function loadMemories(db: SupabaseClient, userId: string): Promise<MemoryRow[]> {
+  const { data, error } = await db
+    .from('chat_memories')
+    .select('id, content')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: true })
+    .limit(MAX_MEMORIES)
+  return error ? [] : (data as MemoryRow[])
+}
+
+/** Keyword search over the user's other chats ("Search and reference chats"). */
+async function searchPastChats(db: SupabaseClient, text: string, conversationId: string): Promise<string> {
+  const words = text.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? []
+  const query = [...new Set(words.filter((w) => !STOPWORDS.has(w)))].slice(0, 8).join(' or ')
+  if (!query) return ''
+  const { data, error } = await db.rpc('search_chat_messages', {
+    query,
+    exclude_conversation: conversationId,
+    match_count: 6,
+  })
+  if (error || !Array.isArray(data) || data.length === 0) return ''
+  return (data as Array<{ title: string; role: string; snippet: string; created_at: string }>)
+    .map((r) =>
+      `- [${r.title}, ${String(r.created_at).slice(0, 10)}] ${r.role === 'user' ? 'User' : 'Assistant'}: ${
+        stripArtifacts(r.snippet).replace(/\s+/g, ' ').slice(0, 400)
+      }`
+    )
+    .join('\n')
+}
 
 /** Keep the newest messages that fit the budget, oldest first. */
 function fitHistory(rows: HistoryRow[]): ChatMessage[] {
@@ -291,14 +435,37 @@ function fitHistory(rows: HistoryRow[]): ChatMessage[] {
   return merged
 }
 
-function buildSystemPrompt(opts: { customInstructions: string; chatInstructions: string; timezone: string }): string {
+function buildSystemPrompt(opts: {
+  customInstructions: string
+  chatInstructions: string
+  timezone: string
+  memories: MemoryRow[]
+  pastChats: string
+  artifacts: boolean
+}): string {
   const parts = [SYSTEM_PROMPT.replaceAll('{date}', today(opts.timezone))]
   if (opts.customInstructions.trim()) {
     parts.push(`About the user and how they want you to respond:\n${opts.customInstructions.trim()}`)
   }
+  if (opts.memories.length > 0) {
+    let facts = ''
+    for (const m of opts.memories) {
+      if (facts.length + m.content.length > MEMORY_CONTEXT_CHARS) break
+      facts += `- ${m.content}\n`
+    }
+    parts.push(
+      `What you remember about the user from earlier chats (use it when relevant; don't recite this list unless asked):\n${facts.trim()}`,
+    )
+  }
+  if (opts.pastChats) {
+    parts.push(
+      `Excerpts from the user's past chats that may be relevant (use them only if they help; they may be outdated):\n${opts.pastChats}`,
+    )
+  }
   if (opts.chatInstructions.trim()) {
     parts.push(`Instructions for this chat:\n${opts.chatInstructions.trim()}`)
   }
+  if (opts.artifacts) parts.push(ARTIFACT_PROMPT)
   return parts.join('\n\n')
 }
 
@@ -312,6 +479,120 @@ function today(timezone: string): string {
   return `${new Intl.DateTimeFormat('en-GB', { ...options, timeZone: 'UTC' }).format(new Date())} (UTC)`
 }
 
+// ── Memory ───────────────────────────────────────────────────────────────────
+
+async function runMemoryUpdate(opts: {
+  client: SupabaseClient
+  userId: string
+  model: string
+  memories: MemoryRow[]
+  maxAdds: number
+  task: string
+}): Promise<{ added: number; updated: number; deleted: number }> {
+  const current = opts.memories.length ? opts.memories.map((m) => `[${m.id}] ${m.content}`).join('\n') : '(none yet)'
+  const raw = await complete(opts.model, [
+    { role: 'system', content: MEMORY_SYSTEM },
+    { role: 'user', content: `Current memories:\n${current}\n\n${opts.task}\n\nReply with the JSON object only.` },
+  ], 1500)
+
+  // Parse defensively: models sometimes wrap JSON in prose or code fences.
+  let ops: { add?: unknown; update?: unknown; delete?: unknown } = {}
+  try {
+    ops = JSON.parse(raw.slice(raw.indexOf('{'), raw.lastIndexOf('}') + 1))
+  } catch {
+    return { added: 0, updated: 0, deleted: 0 }
+  }
+  const ids = new Set(opts.memories.map((m) => m.id))
+  const tidy = (v: unknown) => typeof v === 'string' ? clean(v).replace(/\s+/g, ' ').trim().slice(0, 300) : ''
+  const deletes = (Array.isArray(ops.delete) ? ops.delete : []).filter((id): id is string =>
+    typeof id === 'string' && ids.has(id)
+  )
+  const updates = ((Array.isArray(ops.update) ? ops.update : []) as Array<{ id?: unknown; content?: unknown }>)
+    .map((u) => ({ id: String(u?.id ?? ''), content: tidy(u?.content) }))
+    .filter((u) => ids.has(u.id) && u.content && !deletes.includes(u.id))
+  const known = new Set(opts.memories.map((m) => m.content.toLowerCase()))
+  const room = Math.max(0, MAX_MEMORIES - (opts.memories.length - deletes.length))
+  const adds = [...new Set((Array.isArray(ops.add) ? ops.add : []).map(tidy))]
+    .filter((c) => c && !known.has(c.toLowerCase()))
+    .slice(0, Math.min(opts.maxAdds, room))
+
+  const now = new Date().toISOString()
+  if (deletes.length) {
+    const { error } = await opts.client.from('chat_memories').delete().in('id', deletes).eq('user_id', opts.userId)
+    if (error) throw dbError(error)
+  }
+  for (const u of updates) {
+    const { error } = await opts.client.from('chat_memories').update({ content: u.content, updated_at: now })
+      .eq('id', u.id).eq('user_id', opts.userId)
+    if (error) throw dbError(error)
+  }
+  if (adds.length) {
+    const { error } = await opts.client.from('chat_memories')
+      .insert(adds.map((content) => ({ user_id: opts.userId, content })))
+    if (error) throw dbError(error)
+  }
+  return { added: adds.length, updated: updates.length, deleted: deletes.length }
+}
+
+function stripArtifacts(text: string): string {
+  return text.replace(/<artifact\b([^>]*)>[\s\S]*?(?:<\/artifact>|$)/g, (_m, attrs: string) => {
+    const title = /title="([^"]*)"/.exec(attrs)?.[1]
+    return `[artifact${title ? `: ${title}` : ''}]`
+  })
+}
+
+// ── Model calls ──────────────────────────────────────────────────────────────
+
+function modelHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Authorization': `Bearer ${LLM_API_KEY}`,
+    'Content-Type': 'application/json',
+  }
+  if (IS_OPENROUTER) headers['X-Title'] = 'Minimal Chat'
+  return headers
+}
+
+function outputLimit(tokens: number): Record<string, number> {
+  return tokens > 0 ? { [IS_OPENAI ? 'max_completion_tokens' : 'max_tokens']: tokens } : {}
+}
+
+function postCompletion(payload: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {
+  return fetch(`${LLM_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: modelHeaders(),
+    body: JSON.stringify(payload),
+    signal,
+  })
+}
+
+/** Streaming call. Asks for token usage; retries without if the provider rejects that option. */
+async function callModel(model: string, messages: ChatMessage[], signal: AbortSignal): Promise<Response> {
+  const base = { model, messages, stream: true, ...outputLimit(MAX_OUTPUT_TOKENS) }
+  const res = await postCompletion({ ...base, stream_options: { include_usage: true } }, signal)
+  if (res.status === 400 || res.status === 422) {
+    const detail = await res.clone().text().catch(() => '')
+    if (/stream_options|include_usage/i.test(detail)) {
+      res.body?.cancel().catch(() => {})
+      return postCompletion(base, signal)
+    }
+  }
+  return res
+}
+
+/** Non-streaming call that returns the reply text (used for memory updates). */
+async function complete(model: string, messages: ChatMessage[], maxTokens: number): Promise<string> {
+  const res = await postCompletion(
+    { model, messages, stream: false, ...outputLimit(maxTokens) },
+    AbortSignal.timeout(90_000),
+  )
+  if (!res.ok) throw new HttpError(502, await describeUpstreamError(res))
+  const data = await res.json()
+  const content = data?.choices?.[0]?.message?.content
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) return content.map((p: { text?: string }) => p?.text ?? '').join('')
+  return ''
+}
+
 // ── Streaming ────────────────────────────────────────────────────────────────
 
 function streamReply(opts: {
@@ -321,6 +602,7 @@ function streamReply(opts: {
   meta: StreamEvent
   messages: ChatMessage[]
   saveWith: SupabaseClient
+  afterReply?: (reply: string) => Promise<number>
 }): Response {
   const encoder = new TextEncoder()
   const upstreamAbort = new AbortController()
@@ -408,9 +690,20 @@ function streamReply(opts: {
             ? "The provider's content filter blocked this reply."
             : 'The model returned an empty reply. Try again or pick another model.'
         }
-        const saved = await saver.finish(content, { usage, finishReason })
+        const promptChars = opts.messages.reduce((n, m) => n + m.content.length, 0)
+        const saved = await saver.finish(content, { usage, finishReason, promptChars })
         if (errorMessage) send({ type: 'error', message: errorMessage })
         send({ type: 'done', message_id: saved.id, saved: saved.ok, finish_reason: finishReason })
+
+        // Memory is updated after the reply is shown, so it never slows the answer down.
+        if (opts.afterReply && content && !errorMessage && finishReason !== 'stopped') {
+          try {
+            const changes = await opts.afterReply(content)
+            if (changes > 0) send({ type: 'memory', changes })
+          } catch (err) {
+            console.error('chat: memory update failed', err)
+          }
+        }
         close()
       })().catch((err) => {
         console.error('chat: stream failed', err)
@@ -438,22 +731,6 @@ function streamReply(opts: {
   })
 }
 
-function callModel(model: string, messages: ChatMessage[], signal: AbortSignal): Promise<Response> {
-  const payload: Record<string, unknown> = { model, messages, stream: true }
-  if (MAX_OUTPUT_TOKENS > 0) payload[IS_OPENAI ? 'max_completion_tokens' : 'max_tokens'] = MAX_OUTPUT_TOKENS
-  const headers: Record<string, string> = {
-    'Authorization': `Bearer ${LLM_API_KEY}`,
-    'Content-Type': 'application/json',
-  }
-  if (IS_OPENROUTER) headers['X-Title'] = 'Minimal Chat'
-  return fetch(`${LLM_BASE_URL}/chat/completions`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(payload),
-    signal,
-  })
-}
-
 /** Writes the reply to the database while it streams, so a cut-off stream still leaves most of it saved. */
 function createSaver(opts: { userId: string; model: string; conversationId: string; saveWith: SupabaseClient }) {
   let messageId: string | null = null
@@ -461,27 +738,39 @@ function createSaver(opts: { userId: string; model: string; conversationId: stri
   let ok = true
   let queue: Promise<void> = Promise.resolve()
 
+  const save = async (fields: Record<string, unknown>) => {
+    if (!messageId) {
+      const { data, error } = await opts.saveWith
+        .from('chat_messages')
+        .insert({
+          conversation_id: opts.conversationId,
+          user_id: opts.userId,
+          role: 'assistant',
+          model: opts.model,
+          ...fields,
+        })
+        .select('id')
+        .single()
+      if (error) throw error
+      messageId = data.id
+    } else {
+      const { error } = await opts.saveWith.from('chat_messages').update(fields).eq('id', messageId)
+      if (error) throw error
+    }
+  }
+
   const write = (content: string, extra: Record<string, unknown> = {}) => {
     queue = queue.then(async () => {
       if (!content) return
-      if (!messageId) {
-        const { data, error } = await opts.saveWith
-          .from('chat_messages')
-          .insert({
-            conversation_id: opts.conversationId,
-            user_id: opts.userId,
-            role: 'assistant',
-            content,
-            model: opts.model,
-            ...extra,
-          })
-          .select('id')
-          .single()
-        if (error) throw error
-        messageId = data.id
-      } else {
-        const { error } = await opts.saveWith.from('chat_messages').update({ content, ...extra }).eq('id', messageId)
-        if (error) throw error
+      const fields: Record<string, unknown> = { content, ...extra }
+      try {
+        await save(fields)
+      } catch (err) {
+        // Database not upgraded yet (no tokens_estimated column): save without it.
+        const code = (err as { code?: string })?.code
+        if (!('tokens_estimated' in fields) || (code !== 'PGRST204' && code !== '42703')) throw err
+        delete fields.tokens_estimated
+        await save(fields)
       }
       ok = true
     }).catch((err) => {
@@ -498,11 +787,14 @@ function createSaver(opts: { userId: string; model: string; conversationId: stri
       lastCheckpoint = now
       write(content)
     },
-    async finish(content: string, info: { usage: Usage | null; finishReason: string | null }) {
+    async finish(content: string, info: { usage: Usage | null; finishReason: string | null; promptChars: number }) {
+      // No usage from the provider? Estimate (~4 characters per token) so Usage still shows something.
+      const estimated = !info.usage?.completion_tokens && !info.usage?.prompt_tokens
       await write(content, {
         finish_reason: info.finishReason,
-        prompt_tokens: info.usage?.prompt_tokens ?? null,
-        completion_tokens: info.usage?.completion_tokens ?? null,
+        prompt_tokens: estimated ? Math.ceil(info.promptChars / 4) : info.usage?.prompt_tokens ?? null,
+        completion_tokens: estimated ? Math.ceil(content.length / 4) : info.usage?.completion_tokens ?? null,
+        ...(estimated ? { tokens_estimated: true } : {}),
       })
       return { id: messageId, ok: content ? ok && messageId !== null : true }
     },
@@ -576,7 +868,7 @@ function upstreamMessage(error: unknown): string {
 function dbError(error: { message: string; code?: string }): HttpError {
   console.error('chat: database error', error)
   const hint = error.code === 'PGRST205' || error.code === '42P01'
-    ? ' Did you run supabase/schema.sql?'
+    ? ' Did you run supabase/schema.sql (and upgrade-v2.sql)?'
     : error.code === '42501'
     ? ' Check the grants and policies from supabase/schema.sql.'
     : ''

@@ -3,6 +3,7 @@ import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js
 import { marked } from 'https://cdn.jsdelivr.net/npm/marked@18.0.13/lib/marked.esm.js'
 import DOMPurify from 'https://cdn.jsdelivr.net/npm/dompurify@3.4.15/dist/purify.es.mjs'
 import * as config from './config.js'
+import { artifactCard, collectArtifacts, createArtifactPanel, plainText, splitReply } from './artifacts.js'
 
 window.chatReady = true
 
@@ -30,8 +31,19 @@ const ui = {
   main: $('main'), title: $('chat-title'), messages: $('messages'), thread: $('thread'),
   composer: $('composer'), input: $('input'), model: $('model'), send: $('send'), instructionsBtn: $('instructions-btn'),
   instructionsDialog: $('instructions-dialog'), instructionsText: $('instructions-text'),
-  settingsDialog: $('settings-dialog'), customInstructions: $('custom-instructions'),
-  settingsEmail: $('settings-email'), signOut: $('sign-out'),
+  search: $('chat-search'),
+  settingsDialog: $('settings-dialog'), settingsClose: $('settings-close'), settingsUpgrade: $('settings-upgrade'),
+  themeControl: $('theme-control'), setNotify: $('set-notify'),
+  customInstructions: $('custom-instructions'), saveInstructions: $('save-instructions'),
+  usageReset: $('usage-reset'), usageMonthCost: $('usage-month-cost'), usageMonthTokens: $('usage-month-tokens'),
+  usageMeter: $('usage-meter'), usageMeterFill: $('usage-meter-fill'), usageMeterLabel: $('usage-meter-label'),
+  usageChart: $('usage-chart'), usageTodayCost: $('usage-today-cost'), usageTodayTokens: $('usage-today-tokens'),
+  usageTodayReplies: $('usage-today-replies'), usageModels: $('usage-models'), usageUpdated: $('usage-updated'),
+  usageRefresh: $('usage-refresh'), setBudget: $('set-budget'),
+  setArtifacts: $('set-artifacts'), setReference: $('set-reference'), setMemory: $('set-memory'),
+  memoryCount: $('memory-count'), memoryList: $('memory-list'), memoryForm: $('memory-form'),
+  memoryInstruction: $('memory-instruction'), memorySubmit: $('memory-submit'), memoryClear: $('memory-clear'),
+  settingsEmail: $('settings-email'), signOut: $('sign-out'), exportData: $('export-data'), deleteAll: $('delete-all'),
   toast: $('toast'), srStatus: $('sr-status'),
 }
 
@@ -67,8 +79,12 @@ const state = {
   messages: [], // messages of the chat on screen
   draftInstructions: '', // instructions for a chat that doesn't exist yet
   customInstructions: '',
-  stream: null, // { controller, messages, reply, el, conversationId, instructions }
+  prefs: {}, // chat_settings.preferences: { artifacts, memory, referenceChats, monthlyBudget }
+  v2: true, // false until supabase/upgrade-v2.sql has been run
+  memories: [],
+  stream: null, // { controller, messages, reply, el, conversationId, instructions, autoOpened, finalized }
   loadSeq: 0,
+  searchSeq: 0,
 }
 
 // ── Markdown (sanitized: model output never runs as code) ────────────────────
@@ -114,6 +130,26 @@ function decorateCodeBlock(pre) {
   block.append(bar, pre)
 }
 
+// ── Artifact panel ───────────────────────────────────────────────────────────
+
+const artifactPanel = createArtifactPanel({
+  els: {
+    root: $('artifact-panel'), title: $('ap-title'), meta: $('ap-meta'),
+    versions: $('ap-versions'), version: $('ap-version'), prev: $('ap-prev'), next: $('ap-next'),
+    tabPreview: $('ap-tab-preview'), tabCode: $('ap-tab-code'), body: $('ap-body'),
+    close: $('ap-close'), download: $('ap-download'),
+  },
+  renderMarkdown,
+  onOpenChange: (open) => ui.app.classList.toggle('artifact-open', open),
+})
+$('ap-copy').addEventListener('click', (event) => copyText(artifactPanel.copyText(), event.currentTarget))
+const WIDE_SCREEN = window.matchMedia('(min-width: 900px)')
+
+function openArtifact(id, index, options) {
+  artifactPanel.update(state.messages)
+  artifactPanel.open(id, index, options)
+}
+
 // ── Session ──────────────────────────────────────────────────────────────────
 
 const supabase = configured ? createClient(SUPABASE_URL, SUPABASE_KEY) : null
@@ -152,8 +188,14 @@ function resetState() {
     messages: [],
     draftInstructions: '',
     customInstructions: '',
+    prefs: {},
+    memories: [],
     stream: null,
   })
+  usageRows = null
+  artifactPanel.close()
+  if (ui.settingsDialog.open) ui.settingsDialog.close()
+  ui.search.value = ''
   ui.thread.replaceChildren()
   ui.chatList.replaceChildren()
   if (location.hash) history.replaceState(null, '', location.pathname + location.search)
@@ -216,11 +258,33 @@ async function loadConversations() {
 }
 
 async function loadSettings() {
-  const { data } = await supabase.from('chat_settings').select('custom_instructions').maybeSingle()
-  state.customInstructions = data?.custom_instructions ?? ''
+  let res = await supabase.from('chat_settings').select('custom_instructions, preferences').maybeSingle()
+  state.v2 = !res.error
+  if (res.error) {
+    // Database not upgraded yet (no `preferences` column): fall back to v1 settings.
+    res = await supabase.from('chat_settings').select('custom_instructions').maybeSingle()
+  }
+  state.customInstructions = res.data?.custom_instructions ?? ''
+  state.prefs = res.data?.preferences ?? {}
+}
+
+/** Saves preference changes. Returns false (and restores the old values) if saving fails. */
+async function savePrefs(patch) {
+  const previous = state.prefs
+  state.prefs = { ...state.prefs, ...patch }
+  const { error } = await supabase
+    .from('chat_settings')
+    .upsert({ user_id: state.user.id, preferences: state.prefs, updated_at: new Date().toISOString() })
+  if (!error) return true
+  state.prefs = previous
+  toast(`Couldn't save that setting. ${dbHint(error)}`)
+  return false
 }
 
 function dbHint(error) {
+  if (/chat_memories|preferences|chat_usage|search_chat_messages|tokens_estimated/.test(error.message ?? '')) {
+    return 'Run supabase/upgrade-v2.sql in the SQL Editor first.'
+  }
   if (error.code === 'PGRST205' || error.code === '42P01') return 'Run supabase/schema.sql in the SQL Editor first.'
   if (error.code === '42501') return 'Permission denied. Re-run supabase/schema.sql.'
   return error.message
@@ -236,12 +300,15 @@ function route() {
 }
 
 function goToNewChat() {
-  if (location.hash === '#/') startNewChat()
-  else location.hash = '#/'
+  // Switch right away (not on the async hashchange), so text typed straight after
+  // clicking "New chat" can never end up in the previous chat.
+  if (location.hash !== '#/') history.pushState(null, '', '#/')
+  startNewChat()
 }
 
 function startNewChat() {
   closeSidebar()
+  artifactPanel.close()
   state.loadSeq++
   state.current = null
   // A brand-new chat that is still streaming (no id yet) stays visible.
@@ -260,6 +327,7 @@ function startNewChat() {
 async function openChat(id) {
   closeSidebar()
   if (state.current?.id === id) return
+  artifactPanel.close()
   const seq = ++state.loadSeq
   let conversation = state.conversations.find((c) => c.id === id)
   if (!conversation) {
@@ -335,25 +403,32 @@ async function send() {
   announce('Waiting for the reply…')
 
   let finished = false
+  // The reply is "done" as soon as its text is complete. The connection may stay
+  // open a little longer while the server updates memory in the background.
+  const finalize = () => {
+    if (stream.finalized) return
+    stream.finalized = true
+    reply.pending = false
+    if (state.stream === stream) state.stream = null
+    if (stream.el?.isConnected) {
+      const stick = nearBottom()
+      paintMessage(reply, stream.el)
+      if (stick) scrollToBottom()
+    }
+    if (state.messages === stream.messages) artifactPanel.update(state.messages)
+    updateComposer()
+    announce(reply.error ? 'The reply failed.' : 'Reply finished.')
+    if (!reply.error && reply.content && reply.finish_reason !== 'stopped') notifyReply(reply)
+  }
+
   try {
-    const { data: { session } } = await supabase.auth.getSession()
-    if (!session) throw new Error('Your session has expired. Sign in again.')
-    const res = await fetch(CHAT_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${session.access_token}`,
-        apikey: SUPABASE_KEY,
-      },
-      body: JSON.stringify({
-        conversation_id: conversation?.id ?? null,
-        message: text,
-        model,
-        system_prompt: stream.instructions || undefined,
-        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-      }),
-      signal: stream.controller.signal,
-    })
+    const res = await callFunction({
+      conversation_id: conversation?.id ?? null,
+      message: text,
+      model,
+      system_prompt: stream.instructions || undefined,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    }, stream.controller.signal)
     if (!res.ok || !res.headers.get('content-type')?.includes('text/event-stream')) {
       throw new Error(await responseError(res))
     }
@@ -371,23 +446,34 @@ async function send() {
         reply.id = event.message_id
         reply.finish_reason = event.finish_reason
         if (!event.saved) reply.warning = "This reply couldn't be saved to your history."
-      }
+        finalize()
+      } else if (event.type === 'memory') onMemoryUpdated(event.changes)
     }
     if (!finished && !reply.error) reply.error = 'The connection closed before the reply finished.'
   } catch (err) {
-    if (err?.name === 'AbortError') reply.finish_reason = 'stopped'
-    else reply.error = friendlyError(err)
-  } finally {
-    reply.pending = false
-    state.stream = null
-    if (stream.el?.isConnected) {
-      const stick = nearBottom()
-      paintMessage(reply, stream.el)
-      if (stick) scrollToBottom()
+    if (!stream.finalized) {
+      if (err?.name === 'AbortError') reply.finish_reason = 'stopped'
+      else reply.error = friendlyError(err)
     }
-    updateComposer()
-    announce(reply.error ? 'The reply failed.' : 'Reply finished.')
+  } finally {
+    finalize()
   }
+}
+
+/** POSTs to the Edge Function as the signed-in user. */
+async function callFunction(body, signal) {
+  const { data: { session } } = await supabase.auth.getSession()
+  if (!session) throw new Error('Your session has expired. Sign in again.')
+  return fetch(CHAT_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${session.access_token}`,
+      apikey: SUPABASE_KEY,
+    },
+    body: JSON.stringify(body),
+    signal,
+  })
 }
 
 function stop() {
@@ -479,6 +565,7 @@ function renderThread() {
     return node
   }))
   ui.main.classList.toggle('is-empty', state.messages.length === 0)
+  artifactPanel.update(state.messages)
   updateComposer()
 }
 
@@ -489,9 +576,24 @@ function paintMessage(message, node) {
   }
   const parts = []
   if (message.content) {
-    const md = el('div', 'md')
-    renderMarkdown(md, message.content)
-    parts.push(md)
+    // Text is rendered as Markdown; each <artifact> becomes a card that opens the side panel.
+    const list = state.stream?.reply === message ? state.stream.messages : state.messages
+    const index = list.indexOf(message)
+    let versions = null
+    for (const part of splitReply(message.content, message.pending)) {
+      if (part.kind === 'text') {
+        if (!part.text.trim()) continue
+        const md = el('div', 'md')
+        renderMarkdown(md, part.text)
+        parts.push(md)
+      } else {
+        versions ??= collectArtifacts(list)
+        const all = versions.get(part.id) ?? []
+        const position = all.findIndex((v) => v.messageIndex === index && v.content === part.content)
+        parts.push(artifactCard(part, position >= 0 ? position + 1 : all.length || 1, openArtifact))
+      }
+    }
+    if (parts.length === 0 && message.pending) parts.push(typingDots())
   } else if (message.pending) {
     parts.push(message.thinking ? el('div', 'thinking', 'Thinking…') : typingDots())
   }
@@ -513,7 +615,7 @@ function noteFor(message) {
 function messageMeta(message) {
   const row = el('div', 'msg-meta')
   const copy = iconButton('i-copy', 'Copy reply')
-  copy.addEventListener('click', () => copyText(message.content, copy))
+  copy.addEventListener('click', () => copyText(plainText(message.content), copy))
   row.append(copy)
   if (message.model) row.append(el('span', 'msg-model', modelLabel(message.model)))
   return row
@@ -537,10 +639,22 @@ function queuePaint() {
     const stick = nearBottom()
     paintMessage(stream.reply, stream.el)
     if (stick) scrollToBottom()
+    if (stream.messages !== state.messages) return
+    // The first artifact of a reply opens the panel by itself (on wide screens), like Claude.
+    if (!stream.autoOpened && WIDE_SCREEN.matches) {
+      const first = splitReply(stream.reply.content, true).find((p) => p.kind === 'artifact')
+      if (first) {
+        stream.autoOpened = true
+        openArtifact(first.id, null, { focus: false })
+        return
+      }
+    }
+    artifactPanel.update(state.messages)
   })
 }
 
 function renderSidebar() {
+  if (ui.search.value.trim()) return void runSearch()
   if (state.conversations.length === 0) {
     ui.chatList.replaceChildren(el('p', 'chat-list-empty', 'Your chats will show up here.'))
     return
@@ -583,6 +697,91 @@ function renderSidebar() {
     nodes.push(group)
   }
   ui.chatList.replaceChildren(...nodes)
+}
+
+// ── Search ───────────────────────────────────────────────────────────────────
+
+let searchTimer
+ui.search.addEventListener('input', () => {
+  clearTimeout(searchTimer)
+  searchTimer = setTimeout(runSearch, 220)
+})
+ui.search.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape' || !ui.search.value) return
+  event.stopPropagation()
+  ui.search.value = ''
+  renderSidebar()
+})
+
+/** Titles match as you type; message text is searched word by word in the database. */
+async function runSearch() {
+  const query = ui.search.value.trim()
+  const seq = ++state.searchSeq
+  if (!query) return renderSidebar()
+  const lower = query.toLowerCase()
+  const titleHits = state.conversations
+    .filter((c) => (c.title || '').toLowerCase().includes(lower))
+    .map((c) => ({ id: c.id, title: c.title, snippet: '' }))
+  renderSearchResults(query, titleHits, state.v2)
+  if (!state.v2) return
+  const { data, error } = await supabase.rpc('search_chat_messages', {
+    query,
+    exclude_conversation: null,
+    match_count: 20,
+  })
+  if (seq !== state.searchSeq) return
+  const seen = new Set(titleHits.map((h) => h.id))
+  const textHits = []
+  for (const row of error ? [] : data ?? []) {
+    if (seen.has(row.conversation_id)) continue
+    seen.add(row.conversation_id)
+    textHits.push({ id: row.conversation_id, title: row.title, snippet: plainText(row.snippet ?? '') })
+  }
+  renderSearchResults(query, [...titleHits, ...textHits], false)
+}
+
+function renderSearchResults(query, hits, searching) {
+  const nodes = [el('div', 'chat-group-label', searching ? 'Searching…' : `${hits.length} result${hits.length === 1 ? '' : 's'}`)]
+  for (const hit of hits) {
+    const item = el('div', `chat-item search-item${state.current?.id === hit.id ? ' active' : ''}`)
+    const link = el('a')
+    link.href = `#/c/${hit.id}`
+    link.addEventListener('click', closeSidebar)
+    link.append(el('span', 'search-title', hit.title || 'New chat'))
+    if (hit.snippet) link.append(highlight(excerpt(hit.snippet, query), query))
+    item.append(link)
+    nodes.push(item)
+  }
+  if (!hits.length && !searching) nodes.push(el('p', 'chat-list-empty', `No chats match “${query}”.`))
+  const group = el('div', 'chat-group')
+  group.append(...nodes)
+  ui.chatList.replaceChildren(group)
+}
+
+/** ~90 characters around the first matching word. */
+function excerpt(text, query) {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean)
+  const at = Math.min(...words.map((w) => flat.toLowerCase().indexOf(w)).filter((i) => i >= 0), Infinity)
+  if (!Number.isFinite(at) || at < 40) return flat.slice(0, 90)
+  return `…${flat.slice(at - 30, at + 60)}`
+}
+
+/** Wraps the query words in <mark>, built with text nodes (never innerHTML). */
+function highlight(text, query) {
+  const out = el('span', 'search-snippet')
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean).map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  if (!words.length) {
+    out.textContent = text
+    return out
+  }
+  const splitter = new RegExp(`(${words.join('|')})`, 'gi')
+  const lowerWords = new Set(query.toLowerCase().split(/\s+/).filter(Boolean))
+  for (const piece of text.split(splitter)) {
+    if (!piece) continue
+    out.append(lowerWords.has(piece.toLowerCase()) ? el('mark', '', piece) : document.createTextNode(piece))
+  }
+  return out
 }
 
 function updateComposer() {
@@ -665,29 +864,474 @@ ui.instructionsDialog.addEventListener('close', async () => {
   } else toast('Instructions saved. They apply from your next message.')
 })
 
-ui.account.addEventListener('click', () => {
+// ── Settings ─────────────────────────────────────────────────────────────────
+
+let settingsPane = 'general'
+
+function openSettings(pane = 'general') {
+  closeSidebar()
+  ui.settingsUpgrade.hidden = state.v2
+  ui.settingsDialog.querySelectorAll('[data-v2]').forEach((node) => (node.disabled = !state.v2))
   ui.customInstructions.value = state.customInstructions
   ui.settingsEmail.textContent = state.user?.email ?? ''
-  ui.settingsDialog.returnValue = ''
-  ui.settingsDialog.showModal()
+  syncThemeControl()
+  ui.setNotify.checked = notificationsOn()
+  ui.setArtifacts.checked = state.prefs.artifacts !== false
+  ui.setMemory.checked = state.prefs.memory !== false
+  ui.setReference.checked = state.prefs.referenceChats === true
+  ui.setBudget.value = state.prefs.monthlyBudget ?? ''
+  ui.memorySubmit.disabled = !state.v2 || !ui.memoryInstruction.value.trim()
+  if (!ui.settingsDialog.open) ui.settingsDialog.showModal()
+  showPane(pane)
+}
+
+function showPane(pane) {
+  settingsPane = pane
+  for (const tab of ui.settingsDialog.querySelectorAll('.settings-tab')) {
+    const on = tab.dataset.pane === pane
+    tab.classList.toggle('active', on)
+    if (on) tab.setAttribute('aria-current', 'page')
+    else tab.removeAttribute('aria-current')
+  }
+  for (const section of ui.settingsDialog.querySelectorAll('.settings-pane')) {
+    section.hidden = section.dataset.pane !== pane
+  }
+  ui.settingsDialog.querySelector('.settings-main').scrollTop = 0
+  if (pane === 'usage') loadUsage()
+  if (pane === 'memory') loadMemories()
+}
+
+ui.account.addEventListener('click', () => openSettings('general'))
+ui.settingsClose.addEventListener('click', () => ui.settingsDialog.close())
+ui.settingsDialog.addEventListener('click', (event) => {
+  if (event.target === ui.settingsDialog) ui.settingsDialog.close() // click on the backdrop
+})
+for (const tab of ui.settingsDialog.querySelectorAll('.settings-tab')) {
+  tab.addEventListener('click', () => showPane(tab.dataset.pane))
+}
+
+// General → theme (this device only)
+let themeChoice = ['light', 'dark'].includes(store.get('chat.theme')) ? store.get('chat.theme') : 'system'
+
+function applyTheme(value) {
+  themeChoice = value
+  if (value === 'light' || value === 'dark') document.documentElement.dataset.theme = value
+  else delete document.documentElement.dataset.theme
+  store.set('chat.theme', value)
+  syncThemeControl()
+}
+
+function syncThemeControl() {
+  for (const button of ui.themeControl.querySelectorAll('[data-theme-value]')) {
+    button.setAttribute('aria-checked', String(button.dataset.themeValue === themeChoice))
+  }
+}
+
+ui.themeControl.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-theme-value]')
+  if (button) applyTheme(button.dataset.themeValue)
 })
 
-ui.settingsDialog.addEventListener('close', async () => {
-  if (ui.settingsDialog.returnValue !== 'save') return
+// General → notifications (this device only)
+function notificationsOn() {
+  return store.get('chat.notify') === '1' && 'Notification' in window && Notification.permission === 'granted'
+}
+
+ui.setNotify.addEventListener('change', async () => {
+  if (!ui.setNotify.checked) return store.set('chat.notify', '0')
+  if (!('Notification' in window)) {
+    ui.setNotify.checked = false
+    return toast("This browser doesn't support notifications.")
+  }
+  const permission = Notification.permission === 'default'
+    ? await Notification.requestPermission()
+    : Notification.permission
+  if (permission !== 'granted') {
+    ui.setNotify.checked = false
+    store.set('chat.notify', '0')
+    return toast('Notifications are blocked for this site. Allow them in your browser settings, then try again.')
+  }
+  store.set('chat.notify', '1')
+  toast("You'll get a notification when a reply finishes in the background.")
+})
+
+function notifyReply(reply) {
+  if (!document.hidden || !notificationsOn()) return
+  try {
+    const body = plainText(reply.content).replace(/[#*_`>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140)
+    const notification = new Notification(`${APP_NAME}: reply ready`, { body, tag: 'chat-reply' })
+    notification.onclick = () => {
+      window.focus()
+      notification.close()
+    }
+  } catch { /* some mobile browsers only allow notifications from a service worker */ }
+}
+
+// General → instructions for every chat
+ui.saveInstructions.addEventListener('click', async () => {
   const value = ui.customInstructions.value.trim()
-  if (value === state.customInstructions) return
+  ui.saveInstructions.disabled = true
   const { error } = await supabase
     .from('chat_settings')
     .upsert({ user_id: state.user.id, custom_instructions: value, updated_at: new Date().toISOString() })
-  if (error) return toast(`Couldn't save your settings. ${dbHint(error)}`)
+  ui.saveInstructions.disabled = false
+  if (error) return toast(`Couldn't save your instructions. ${dbHint(error)}`)
   state.customInstructions = value
-  toast('Custom instructions saved.')
+  toast('Instructions saved. They apply from your next message.')
 })
 
+// Capabilities & Memory switches (saved to Supabase, so they follow you across devices)
+function bindPreference(input, key, onMessage, offMessage) {
+  input.addEventListener('change', async () => {
+    const value = input.checked
+    input.disabled = true
+    const ok = await savePrefs({ [key]: value })
+    input.disabled = false
+    if (!ok) input.checked = !value
+    else toast(value ? onMessage : offMessage)
+  })
+}
+bindPreference(ui.setArtifacts, 'artifacts', 'Artifacts on. They apply from your next message.', 'Artifacts off. Code will appear in replies as plain text.')
+bindPreference(ui.setReference, 'referenceChats', 'The model can now look up your past chats.', "The model won't look up your past chats.")
+bindPreference(ui.setMemory, 'memory', 'Memory on. The model will save and use facts about you.', 'Memory off. Saved memories stay until you delete them.')
+
+// Usage
+let usageRows = null
+let usageLoadedAt = null
+
+async function loadUsage() {
+  if (!state.v2) return renderUsage()
+  const now = new Date()
+  const since = new Date(now.getFullYear(), now.getMonth(), 1)
+  ui.usageUpdated.textContent = 'Loading…'
+  const { data, error } = await supabase.rpc('chat_usage', {
+    since: since.toISOString(),
+    tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  })
+  if (error) {
+    ui.usageUpdated.textContent = '—'
+    return toast(`Couldn't load usage. ${dbHint(error)}`)
+  }
+  usageRows = data ?? []
+  usageLoadedAt = new Date()
+  renderUsage()
+}
+
+function renderUsage() {
+  const now = new Date()
+  const todayKey = dateKey(now)
+  const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1)
+  const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate()
+  const blank = () => ({ tokens: 0, cost: 0, replies: 0, estimated: false, unpriced: false })
+  const month = blank()
+  const today = blank()
+  const models = new Map()
+  const days = new Map()
+
+  for (const row of usageRows ?? []) {
+    const tokens = Number(row.prompt_tokens) + Number(row.completion_tokens)
+    const price = MODELS.find((m) => m.id === row.model)?.price
+    const priced = typeof price === 'number'
+    const cost = priced ? (tokens * price) / 1_000_000 : 0
+    if (!models.has(row.model)) models.set(row.model, blank())
+    const targets = [month, models.get(row.model)]
+    const dayKey = String(row.day).slice(0, 10) // 'YYYY-MM-DD'
+    if (dayKey === todayKey) targets.push(today)
+    for (const t of targets) {
+      t.tokens += tokens
+      t.cost += cost
+      t.replies += Number(row.replies)
+      t.estimated ||= Boolean(row.estimated)
+      t.unpriced ||= !priced
+    }
+    const day = days.get(dayKey) ?? { cost: 0, tokens: 0 }
+    day.cost += cost
+    day.tokens += tokens
+    days.set(dayKey, day)
+  }
+
+  const approx = (t) => (t.estimated ? '≈ ' : '')
+  ui.usageReset.textContent = `Resets on ${nextMonth.toLocaleDateString('en-GB', { day: 'numeric', month: 'long' })}`
+  ui.usageMonthCost.textContent = `${approx(month)}${rupiah(month.cost)}`
+  ui.usageMonthTokens.textContent = `${formatTokens(month.tokens)} tokens · ${month.replies} ${month.replies === 1 ? 'reply' : 'replies'}`
+  ui.usageTodayCost.textContent = `${approx(today)}${rupiah(today.cost)}`
+  ui.usageTodayTokens.textContent = `${formatTokens(today.tokens)} tokens`
+  ui.usageTodayReplies.textContent = `${today.replies} ${today.replies === 1 ? 'reply' : 'replies'} so far`
+
+  const budget = Number(state.prefs.monthlyBudget) || 0
+  ui.usageMeter.hidden = budget <= 0
+  ui.usageMeter.classList.remove('warn', 'over')
+  if (budget > 0) {
+    const share = month.cost / budget
+    ui.usageMeterFill.style.width = `${Math.min(100, share * 100)}%`
+    if (share >= 1) ui.usageMeter.classList.add('over')
+    else if (share >= 0.8) ui.usageMeter.classList.add('warn')
+    ui.usageMeterLabel.textContent = `${Math.round(share * 100)}% of your ${rupiah(budget)} budget used${
+      share >= 1 ? '. You are over budget this month.' : ''
+    }`
+  } else {
+    ui.usageMeterLabel.textContent = 'Set a monthly budget below to see how much of it you have used.'
+  }
+
+  // Daily bars for this month (cost, or tokens if no model has a price)
+  const byCost = month.cost > 0
+  const values = Array.from({ length: daysInMonth }, (_, i) => {
+    const key = dateKey(new Date(now.getFullYear(), now.getMonth(), i + 1))
+    const d = days.get(key)
+    return d ? (byCost ? d.cost : d.tokens) : 0
+  })
+  const max = Math.max(...values, 0)
+  ui.usageChart.replaceChildren(...values.map((value, i) => {
+    const bar = el('span', `bar${i + 1 === now.getDate() ? ' today' : ''}${i + 1 > now.getDate() ? ' future' : ''}`)
+    bar.style.height = `${max > 0 && value > 0 ? Math.max(6, (value / max) * 100) : 3}%`
+    bar.title = `${i + 1} ${now.toLocaleDateString('en-GB', { month: 'short' })}: ${
+      byCost ? rupiah(value) : `${formatTokens(value)} tokens`
+    }`
+    return bar
+  }))
+
+  const rows = [...models.entries()].sort((a, b) => b[1].cost - a[1].cost || b[1].tokens - a[1].tokens)
+  ui.usageModels.replaceChildren(...(rows.length
+    ? rows.map(([id, t]) => {
+      const tr = el('tr')
+      tr.append(
+        el('td', '', modelLabel(id)),
+        el('td', 'num', String(t.replies)),
+        el('td', 'num', `${approx(t)}${formatTokens(t.tokens)}`),
+        el('td', 'num', t.unpriced && t.cost === 0 ? '—' : `${approx(t)}${rupiah(t.cost)}`),
+      )
+      return tr
+    })
+    : [(() => {
+      const tr = el('tr')
+      const td = el('td', 'empty', state.v2 ? 'No replies yet this month.' : 'Usage needs the database update above.')
+      td.colSpan = 4
+      tr.append(td)
+      return tr
+    })()]))
+  ui.usageUpdated.textContent = usageLoadedAt
+    ? usageLoadedAt.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
+    : '—'
+}
+
+ui.usageRefresh.addEventListener('click', loadUsage)
+ui.setBudget.addEventListener('change', async () => {
+  const raw = ui.setBudget.value.trim()
+  const value = raw === '' ? null : Math.max(0, Math.round(Number(raw)))
+  if (value !== null && !Number.isFinite(value)) return
+  if (await savePrefs({ monthlyBudget: value })) {
+    renderUsage()
+    toast(value ? `Monthly budget set to ${rupiah(value)}.` : 'Monthly budget removed.')
+  }
+})
+
+// Memory
+async function loadMemories() {
+  if (!state.v2) return renderMemories()
+  const { data, error } = await supabase
+    .from('chat_memories')
+    .select('id, content, created_at')
+    .order('created_at', { ascending: false })
+  if (error) return toast(`Couldn't load memory. ${dbHint(error)}`)
+  state.memories = data
+  renderMemories()
+}
+
+function renderMemories() {
+  const list = state.memories
+  ui.memoryCount.textContent = list.length ? `${list.length} saved` : ''
+  if (!state.v2) {
+    ui.memoryList.replaceChildren(el('li', 'memory-empty', 'Memory needs the database update above.'))
+  } else if (!list.length) {
+    ui.memoryList.replaceChildren(el(
+      'li',
+      'memory-empty',
+      'Nothing saved yet. Mention something about yourself in a chat, or type it below, e.g. "Remember that I work in Jakarta."',
+    ))
+  } else {
+    ui.memoryList.replaceChildren(...list.map(memoryItem))
+  }
+}
+
+function memoryItem(memory) {
+  const item = el('li', 'memory-item')
+  const edit = iconButton('i-edit', 'Edit memory')
+  const remove = iconButton('i-trash', 'Delete memory')
+  edit.addEventListener('click', () => editMemory(item, memory))
+  remove.addEventListener('click', () => deleteMemory(memory))
+  const actions = el('span', 'memory-actions')
+  actions.append(edit, remove)
+  item.append(el('span', 'memory-text', memory.content), actions)
+  return item
+}
+
+function editMemory(item, memory) {
+  const input = el('input', 'memory-input')
+  input.value = memory.content
+  input.maxLength = 500
+  input.setAttribute('aria-label', 'Edit memory')
+  item.replaceChildren(input)
+  input.focus()
+  let done = false
+  const finish = async (save) => {
+    if (done) return
+    done = true
+    const value = input.value.replace(/\s+/g, ' ').trim()
+    if (save && value && value !== memory.content) {
+      const { error } = await supabase
+        .from('chat_memories')
+        .update({ content: value, updated_at: new Date().toISOString() })
+        .eq('id', memory.id)
+      if (error) toast(`Couldn't save that memory. ${dbHint(error)}`)
+      else memory.content = value
+    }
+    renderMemories()
+  }
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      finish(true)
+    } else if (event.key === 'Escape') {
+      event.preventDefault() // keep the dialog open
+      finish(false)
+    }
+  })
+  input.addEventListener('blur', () => finish(true))
+}
+
+async function deleteMemory(memory) {
+  const { error } = await supabase.from('chat_memories').delete().eq('id', memory.id)
+  if (error) return toast(`Couldn't delete that memory. ${dbHint(error)}`)
+  state.memories = state.memories.filter((m) => m.id !== memory.id)
+  renderMemories()
+}
+
+ui.memoryInstruction.addEventListener('input', () => {
+  ui.memorySubmit.disabled = !state.v2 || !ui.memoryInstruction.value.trim()
+})
+
+ui.memoryForm.addEventListener('submit', async (event) => {
+  event.preventDefault()
+  const instruction = ui.memoryInstruction.value.trim()
+  if (!instruction || !state.v2) return
+  ui.memoryForm.classList.add('is-busy')
+  ui.memoryInstruction.disabled = true
+  ui.memorySubmit.disabled = true
+  try {
+    const res = await callFunction({ action: 'memory_edit', instruction, model: ui.model.value })
+    if (!res.ok) throw new Error(await responseError(res))
+    const result = await res.json()
+    state.memories = [...(result.memories ?? [])].reverse() // newest first
+    renderMemories()
+    ui.memoryInstruction.value = ''
+    toast(memorySummary(result))
+  } catch (err) {
+    toast(friendlyError(err))
+  } finally {
+    ui.memoryForm.classList.remove('is-busy')
+    ui.memoryInstruction.disabled = false
+    ui.memorySubmit.disabled = !ui.memoryInstruction.value.trim()
+    ui.memoryInstruction.focus()
+  }
+})
+
+function memorySummary({ added = 0, updated = 0, deleted = 0 }) {
+  const parts = []
+  if (added) parts.push(`${added} added`)
+  if (updated) parts.push(`${updated} updated`)
+  if (deleted) parts.push(`${deleted} removed`)
+  return parts.length ? `Memory updated: ${parts.join(', ')}.` : 'No changes were needed.'
+}
+
+function onMemoryUpdated(changes) {
+  toast(changes === 1 ? 'Memory updated.' : `Memory updated (${changes} changes).`)
+  if (ui.settingsDialog.open && settingsPane === 'memory') loadMemories()
+}
+
+ui.memoryClear.addEventListener('click', async () => {
+  if (!state.memories.length) await loadMemories()
+  if (!state.memories.length) return toast('There are no memories to delete.')
+  if (!confirm("Delete everything the model remembers about you? This can't be undone.")) return
+  const { error } = await supabase.from('chat_memories').delete().eq('user_id', state.user.id)
+  if (error) return toast(`Couldn't delete your memories. ${dbHint(error)}`)
+  state.memories = []
+  renderMemories()
+  toast('All memories deleted.')
+})
+
+// Account
 ui.signOut.addEventListener('click', async () => {
   ui.settingsDialog.close()
   await supabase.auth.signOut()
 })
+
+ui.exportData.addEventListener('click', async () => {
+  ui.exportData.disabled = true
+  try {
+    const [conversations, messages] = await Promise.all([
+      fetchAll(() =>
+        supabase.from('chat_conversations').select('id, title, model, system_prompt, created_at, updated_at')
+          .order('created_at', { ascending: true })
+      ),
+      fetchAll(() =>
+        supabase.from('chat_messages')
+          .select('conversation_id, role, content, model, finish_reason, prompt_tokens, completion_tokens, created_at')
+          .order('created_at', { ascending: true })
+      ),
+    ])
+    const memories = state.v2
+      ? (await supabase.from('chat_memories').select('content, created_at').order('created_at', { ascending: true })).data ?? []
+      : []
+    const chats = new Map(conversations.map((c) => [c.id, { ...c, messages: [] }]))
+    for (const { conversation_id: id, ...message } of messages) chats.get(id)?.messages.push(message)
+    const payload = {
+      app: APP_NAME,
+      exported_at: new Date().toISOString(),
+      account: state.user.email,
+      settings: { custom_instructions: state.customInstructions, preferences: state.prefs },
+      memories,
+      conversations: [...chats.values()],
+    }
+    saveFile(`${APP_NAME.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-export-${dateKey(new Date())}.json`, JSON.stringify(payload, null, 2))
+    toast(`Exported ${conversations.length} ${conversations.length === 1 ? 'chat' : 'chats'}.`)
+  } catch (err) {
+    toast(`Couldn't export your data. ${err?.message ?? err}`)
+  } finally {
+    ui.exportData.disabled = false
+  }
+})
+
+ui.deleteAll.addEventListener('click', async () => {
+  if (!confirm("Delete all chats and their messages? This can't be undone.")) return
+  state.stream?.controller.abort()
+  const { error } = await supabase.from('chat_conversations').delete().eq('user_id', state.user.id)
+  if (error) return toast(`Couldn't delete your chats. ${dbHint(error)}`)
+  state.conversations = []
+  ui.settingsDialog.close()
+  renderSidebar()
+  goToNewChat()
+  toast('All chats deleted.')
+})
+
+/** Reads every row, 1,000 at a time (Supabase returns at most 1,000 per request). */
+async function fetchAll(build) {
+  const rows = []
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await build().range(from, from + 999)
+    if (error) throw new Error(dbHint(error))
+    rows.push(...data)
+    if (data.length < 1000) return rows
+  }
+}
+
+function saveFile(name, text) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'application/json;charset=utf-8' }))
+  const link = Object.assign(document.createElement('a'), { href: url, download: name })
+  document.body.append(link)
+  link.click()
+  link.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
 
 // ── Composer ─────────────────────────────────────────────────────────────────
 
@@ -752,10 +1396,29 @@ ui.scrim.addEventListener('click', closeSidebar)
 ui.newChat.addEventListener('click', goToNewChat)
 ui.topbarNew.addEventListener('click', goToNewChat)
 document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape') closeSidebar()
+  if (event.key !== 'Escape' || document.querySelector('dialog[open]')) return
+  if (ui.app.classList.contains('sidebar-open')) closeSidebar()
+  else if (artifactPanel.openId) artifactPanel.close()
 })
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+function dateKey(date) {
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+/** Rupiah, with cents only for tiny amounts (a single reply often costs less than Rp 1). */
+function rupiah(value) {
+  const digits = value > 0 && value < 100 ? 2 : 0
+  return `Rp ${value.toLocaleString('id-ID', { minimumFractionDigits: digits, maximumFractionDigits: digits })}`
+}
+
+function formatTokens(n) {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 10_000) return `${Math.round(n / 1000)}K`
+  return n.toLocaleString('en-US')
+}
 
 function el(tag, className = '', text) {
   const node = document.createElement(tag)

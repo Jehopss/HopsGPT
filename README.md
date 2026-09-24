@@ -8,13 +8,27 @@ API key model **nggak pernah sampai ke browser**: disimpan di Edge Function secr
 ```
 minimal-chat/
 ├── supabase/
-│   ├── schema.sql              ← tabel + Row Level Security (jalankan sekali)
-│   └── functions/chat/index.ts ← Edge Function: panggil model, stream balasan, simpan history
+│   ├── schema.sql              ← tabel + Row Level Security (install baru: jalankan ini aja)
+│   ├── upgrade-v2.sql          ← buat yang udah install versi pertama
+│   └── functions/chat/index.ts ← Edge Function: panggil model, stream, simpan history, memory
 └── web/                        ← frontend statis (tanpa build)
     ├── index.html
     ├── style.css
     ├── app.js
-    └── config.js               ← isi URL + key Supabase + daftar model di sini
+    ├── artifacts.js            ← panel artifact (preview HTML/SVG/dokumen)
+    └── config.js               ← isi URL + key Supabase + daftar model + harga di sini
+
+## Fitur
+
+- **Chat + history** tersimpan di Supabase, pilih model per pesan, streaming, tombol Stop, markdown
+- **Artifacts**: model bisa bikin halaman web, app kecil, SVG, atau dokumen panjang yang muncul di panel samping (Preview / Code, versi v1–v2–v3, Copy, Download). Preview jalan di iframe terisolasi, jadi kodenya nggak bisa ngakses login atau data lo
+- **Settings** ala Claude:
+  - **General**: tema (System/Light/Dark), notifikasi browser pas balasan selesai, instruksi buat semua chat
+  - **Usage**: pemakaian token & estimasi biaya bulan ini dan hari ini, grafik harian, per model, budget bulanan
+  - **Capabilities**: nyalain/matiin Artifacts
+  - **Memory**: memory otomatis dari chat (bisa dilihat, diedit, dihapus, atau disuruh "tambah/ubah/hapus …"), plus "Search and reference chats"
+  - **Account**: export semua data (JSON), hapus semua chat, sign out
+- **Cari chat** di sidebar: judul langsung, isi pesan per kata
 ```
 
 ## 1 API key buat semua model?
@@ -49,6 +63,7 @@ Id model yang persis bisa dicek di dokumentasi provider masing-masing (OpenRoute
 
 ### 2. Bikin tabel
 **SQL Editor** → **New query** → paste seluruh isi `supabase/schema.sql` → **Run**.
+(File ini udah termasuk semua fitur v2. `upgrade-v2.sql` cuma buat yang install versi pertama, lihat bagian **Update ke v2** di bawah.)
 Harusnya muncul "Success". Tabel `chat_conversations`, `chat_messages`, dan `chat_settings` sekarang ada di **Table Editor**.
 
 ### 3. Deploy Edge Function
@@ -92,14 +107,24 @@ Buka URL-nya → login → chat.
 
 ---
 
+## Update ke v2 (kalau udah pakai versi pertama)
+
+1. **Database**: SQL Editor → paste isi `supabase/upgrade-v2.sql` → **Run**. Aman dijalanin lebih dari sekali, data lama nggak kesentuh.
+2. **Edge Function**: Edge Functions → `chat` → **Code** → ganti seluruh isinya dengan `supabase/functions/chat/index.ts` yang baru → **Deploy**.
+3. **Frontend**: timpa folder `web/` di repo lo (ada file baru `artifacts.js`), terus `git add .` → `git commit` → `git push`. Cloudflare Pages deploy otomatis.
+4. **Opsional**: tambah secret `MEMORY_MODEL` = model murah buat update memory, misalnya `deepseek-v4-flash` atau `gemini-3.6-flash`. Tanpa ini, memory pakai model yang sama dengan chat.
+
+Kalau langkah 1 belum dijalankan, app tetap jalan, tapi Settings nampilin banner kuning dan Usage/Memory/Search dimatiin dulu.
+
 ## Cara kerja history & konteks
 
 Model AI itu **stateless**: tiap request dia lupa semuanya. Jadi tiap kamu kirim pesan, function-nya:
 
 1. Simpan pesan kamu ke `chat_messages`
 2. Ambil history chat itu dari database (default: 40 pesan terakhir, maksimal ±60.000 karakter)
-3. Susun konteks: **system prompt** (termasuk tanggal hari ini) + **Custom instructions** (Settings, berlaku di semua chat) + **Instructions** chat ini (tombol di kolom ketik) + history
+3. Susun konteks: **system prompt** (termasuk tanggal hari ini) + **instruksi buat semua chat** (Settings → General) + **Memory** (fakta tentang lo yang udah diingat) + potongan **chat lama yang relevan** (kalau "Search and reference chats" nyala) + **Instructions** chat ini (tombol di kolom ketik) + aturan artifact + history
 4. Kirim ke model, stream balasan ke browser, sambil **nyimpen balasan tiap ±2 detik**. Jadi kalau koneksi putus di tengah jalan, sebagian besar balasan tetap tersimpan
+5. Setelah balasan selesai (dan kalau Memory nyala), model ngecek ada fakta baru tentang lo yang perlu diingat. Ini jalan di background, jadi nggak bikin balasan lebih lama
 
 Pesan yang lebih lama dari batas di atas nggak ikut dikirim (masih tersimpan, cuma nggak masuk konteks). Buat topik baru, bikin chat baru: lebih murah dan jawabannya lebih fokus, karena tiap pesan ngirim ulang history-nya.
 
@@ -116,6 +141,7 @@ Pesan yang lebih lama dari batas di atas nggak ikut dikirim (masih tersimpan, cu
 | `CONTEXT_MAX_MESSAGES` | `40` | Jumlah pesan terakhir yang jadi konteks |
 | `CONTEXT_MAX_CHARS` | `60000` | Batas karakter history yang dikirim |
 | `MAX_OUTPUT_TOKENS` | default provider | Batas panjang balasan |
+| `MEMORY_MODEL` | model chat | Model buat update memory di background (pakai yang murah) |
 
 Ganti/tambah model di picker: edit `MODELS` di `web/config.js` (model pertama = default).
 
