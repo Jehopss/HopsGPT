@@ -33,6 +33,7 @@ Function-nya ngomong pakai format OpenAI-compatible `/chat/completions`, jadi se
 | Provider | `LLM_BASE_URL` | Contoh id model |
 |---|---|---|
 | OpenRouter | *(kosongin)* | `anthropic/claude-sonnet-5`, `openai/gpt-5.5`, `google/gemini-3.1-pro-preview` |
+| GutsAI (1 key, banyak model) | `https://api.gutsai.id/v1` | `claude-sonnet-5`, `gpt-5.5`, `deepseek-v4-pro` (daftar lengkap udah ada di `config.js`) |
 | OpenAI | `https://api.openai.com/v1` | `gpt-5.5`, `gpt-5.4-mini` |
 | Anthropic | `https://api.anthropic.com/v1` | `claude-sonnet-5`, `claude-opus-5-5`, `claude-haiku-4-5` |
 | Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` | `gemini-3.1-pro-preview`, `gemini-3-flash-preview` |

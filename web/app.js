@@ -713,7 +713,24 @@ function autosize() {
 }
 
 function fillModelPicker() {
-  ui.model.replaceChildren(...MODELS.map((m) => new Option(m.label || m.id, m.id)))
+  // Models with a `group` are shown under that heading (<optgroup>), in config order.
+  const nodes = []
+  const groups = new Map()
+  for (const m of MODELS) {
+    const option = new Option(m.label || m.id, m.id)
+    if (!m.group) {
+      nodes.push(option)
+      continue
+    }
+    if (!groups.has(m.group)) {
+      const optgroup = document.createElement('optgroup')
+      optgroup.label = m.group
+      groups.set(m.group, optgroup)
+      nodes.push(optgroup)
+    }
+    groups.get(m.group).append(option)
+  }
+  ui.model.replaceChildren(...nodes)
   ui.model.value = preferredModel()
   ui.model.addEventListener('change', () => store.set('chat.model', ui.model.value))
 }
