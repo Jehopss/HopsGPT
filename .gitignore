@@ -1,0 +1,15 @@
+# Secrets & local env (API keys live in Supabase → Edge Functions → Secrets, never in git)
+.env
+.env.*
+supabase/functions/.env
+supabase/.temp/
+supabase/.branches/
+
+# Tooling
+node_modules/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

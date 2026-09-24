@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Chat</title>
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#171716" media="(prefers-color-scheme: dark)">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23191918'/%3E%3Cpath d='M10 12.5h12M10 17.5h8' stroke='%23fff' stroke-width='2.4' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <symbol id="i-new" viewBox="0 0 24 24"><path d="M12 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-6"/><path d="M17.6 3.4a1.9 1.9 0 0 1 2.7 2.7L12 14.4l-3.6.9.9-3.6Z"/></symbol>
+      <symbol id="i-sidebar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9.5 4v16"/></symbol>
+      <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></symbol>
+      <symbol id="i-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor" stroke="none"/></symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9.5 7V5h5v2M18 7l-.8 12a1.5 1.5 0 0 1-1.5 1.4H8.3a1.5 1.5 0 0 1-1.5-1.4L6 7"/></symbol>
+      <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M15 5.5V5a1.5 1.5 0 0 0-1.5-1.5h-8A1.5 1.5 0 0 0 4 5v8.5A1.5 1.5 0 0 0 5.5 15H6"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
+      <symbol id="i-lines" viewBox="0 0 24 24"><path d="M5 7h14M5 12h14M5 17h8"/></symbol>
+      <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 8h9M17 8h3M4 16h3M11 16h9"/><circle cx="15" cy="8" r="2"/><circle cx="9" cy="16" r="2"/></symbol>
+      <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m8 10 4 4 4-4"/></symbol>
+    </defs>
+  </svg>
+
+  <!-- Shown if the app's scripts can't load (e.g. offline) -->
+  <section id="load-error" class="screen" hidden>
+    <div class="card">
+      <h1>Couldn't load the app</h1>
+      <p class="muted">Check your internet connection, then reload the page.</p>
+    </div>
+  </section>
+  <script>
+    setTimeout(function () { if (!window.chatReady) document.getElementById('load-error').hidden = false }, 10000)
+  </script>
+
+  <!-- Shown until config.js is filled in -->
+  <section id="setup" class="screen" hidden>
+    <div class="card">
+      <h1>Almost there</h1>
+      <p class="muted">Open <code>config.js</code> and fill in <code>SUPABASE_URL</code> and <code>SUPABASE_PUBLISHABLE_KEY</code> from Supabase → Project Settings → API Keys. Then reload this page.</p>
+    </div>
+  </section>
+
+  <!-- Sign in / sign up -->
+  <section id="auth" class="screen" hidden>
+    <form id="auth-form" class="card" novalidate>
+      <div class="brand-row"><span class="brand-dot" aria-hidden="true"></span><span class="brand-name" data-app-name>Chat</span></div>
+      <h1 id="auth-title">Sign in</h1>
+      <p id="auth-subtitle" class="muted">Welcome back. Your chats are waiting.</p>
+      <label class="field">
+        <span>Email</span>
+        <input id="auth-email" type="email" autocomplete="email" required>
+      </label>
+      <label class="field">
+        <span>Password</span>
+        <input id="auth-password" type="password" autocomplete="current-password" minlength="6" required>
+      </label>
+      <p id="auth-message" class="form-message" role="alert"></p>
+      <button id="auth-submit" class="btn primary block" type="submit">Sign in</button>
+      <button id="auth-toggle" class="link-btn" type="button">Create an account</button>
+    </form>
+  </section>
+
+  <!-- The app -->
+  <div id="app" class="app" hidden>
+    <aside id="sidebar" class="sidebar" aria-label="Chats">
+      <div class="sidebar-head">
+        <div class="brand-row"><span class="brand-dot" aria-hidden="true"></span><span class="brand-name" data-app-name>Chat</span></div>
+        <button id="new-chat" class="icon-btn" type="button" title="New chat" aria-label="New chat"><svg class="icon"><use href="#i-new"/></svg></button>
+      </div>
+      <nav id="chat-list" class="chat-list"></nav>
+      <button id="account-btn" class="account" type="button" aria-label="Settings">
+        <span id="avatar" class="avatar" aria-hidden="true"></span>
+        <span id="account-email" class="account-email"></span>
+        <svg class="icon" aria-hidden="true"><use href="#i-sliders"/></svg>
+      </button>
+    </aside>
+    <div id="scrim" class="scrim"></div>
+
+    <main id="main" class="main is-empty">
+      <header class="topbar">
+        <button id="menu-btn" class="icon-btn mobile-only" type="button" aria-label="Show chats"><svg class="icon"><use href="#i-sidebar"/></svg></button>
+        <input id="chat-title" class="chat-title" type="text" placeholder="New chat" aria-label="Chat title" maxlength="200" disabled>
+        <button id="topbar-new" class="icon-btn mobile-only" type="button" aria-label="New chat"><svg class="icon"><use href="#i-new"/></svg></button>
+      </header>
+
+      <div id="messages" class="messages">
+        <div id="thread" class="thread"></div>
+      </div>
+
+      <div class="hero">
+        <h2>What can I help with?</h2>
+      </div>
+
+      <form id="composer" class="composer">
+        <div class="composer-box">
+          <textarea id="input" rows="1" placeholder="Message" aria-label="Message" autocomplete="off"></textarea>
+          <div class="composer-row">
+            <button id="instructions-btn" class="chip" type="button" title="Instructions for this chat">
+              <svg class="icon" aria-hidden="true"><use href="#i-lines"/></svg><span>Instructions</span>
+            </button>
+            <div class="composer-actions">
+              <label class="model-picker">
+                <span class="sr-only">Model</span>
+                <select id="model"></select>
+                <svg class="icon" aria-hidden="true"><use href="#i-chevron"/></svg>
+              </label>
+              <button id="send" class="send-btn" type="submit" aria-label="Send" disabled>
+                <svg class="icon"><use href="#i-up"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+        <p class="composer-note">Enter to send · Shift + Enter for a new line</p>
+      </form>
+    </main>
+  </div>
+
+  <dialog id="instructions-dialog" class="dialog">
+    <form method="dialog">
+      <h3>Instructions for this chat</h3>
+      <p class="muted">The model follows these in this chat only. For instructions that apply to every chat, use Settings.</p>
+      <textarea id="instructions-text" rows="8" maxlength="20000" placeholder="e.g. You're my English tutor. Point out my grammar mistakes before you answer."></textarea>
+      <div class="dialog-actions">
+        <button class="btn" value="cancel" formnovalidate>Cancel</button>
+        <button class="btn primary" value="save">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="settings-dialog" class="dialog">
+    <form method="dialog">
+      <h3>Settings</h3>
+      <label class="field">
+        <span>Custom instructions</span>
+        <small class="muted">Used in every chat. Tell the model about yourself and how you like answers.</small>
+        <textarea id="custom-instructions" rows="7" maxlength="20000" placeholder="e.g. I'm a designer. Keep answers short and practical, with examples."></textarea>
+      </label>
+      <div class="account-row">
+        <div><small class="muted">Signed in as</small><div id="settings-email" class="account-row-email"></div></div>
+        <button id="sign-out" class="btn subtle" type="button">Sign out</button>
+      </div>
+      <div class="dialog-actions">
+        <button class="btn" value="cancel" formnovalidate>Cancel</button>
+        <button class="btn primary" value="save">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <div id="sr-status" class="sr-only" aria-live="polite"></div>
+</body>
+</html>
